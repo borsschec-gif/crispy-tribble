@@ -6,6 +6,8 @@ pitch shift (two-tap crossfaded delay line) -> output device
 (a virtual audio cable that Discord uses as its microphone).
 """
 import argparse
+import json
+import os
 import sys
 import wave
 
@@ -233,6 +235,101 @@ def auto_virtual_cable(devices, hostapi):
     return None
 
 
+# virtual cables and system aliases are not real microphones
+NOT_MICS = ["CABLE Output", "BlackHole", "Monitor of", "Mapper", "Переназначение",
+            "Первичный драйвер", "Primary Sound Capture", "Stereo Mix", "Стерео микшер"]
+
+
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+SETTINGS_PATH = os.path.join(app_dir(), "autotune_settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"(не удалось сохранить настройки: {e})")
+
+
+def list_mics(devices, hostapi):
+    return [i for i, d in enumerate(devices)
+            if d["max_input_channels"] > 0 and d["hostapi"] == hostapi
+            and not any(x.lower() in d["name"].lower() for x in NOT_MICS)]
+
+
+def interactive():
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def choose_mic(devices, hostapi, default):
+    mics = list_mics(devices, hostapi) or [default]
+    print("\nВыбери микрофон:")
+    for n, i in enumerate(mics, 1):
+        mark = "  (по умолчанию)" if i == default else ""
+        print(f"  {n}. {devices[i]['name']}{mark}")
+    while True:
+        ans = input("Номер (Enter — по умолчанию): ").strip()
+        if not ans:
+            return default
+        if ans.isdigit() and 1 <= int(ans) <= len(mics):
+            return mics[int(ans) - 1]
+        print("Нет такого номера, попробуй ещё раз.")
+
+
+def install_vb_cable():
+    """Download VB-Audio Virtual Cable from the official site and run its setup."""
+    import re
+    import tempfile
+    import urllib.parse
+    import urllib.request
+    import webbrowser
+    import zipfile
+
+    page = "https://vb-audio.com/Cable/"
+    try:
+        print("Скачиваю VB-Audio Virtual Cable с vb-audio.com ...")
+        req = urllib.request.Request(page, headers={"User-Agent": "Mozilla/5.0"})
+        html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+        m = re.search(r'href="([^"]*VBCABLE_Driver_Pack\d+\.zip)"', html)
+        if not m:
+            raise RuntimeError("ссылка на установщик не найдена")
+        url = urllib.parse.urljoin(page, m.group(1))
+        folder = tempfile.mkdtemp(prefix="vbcable_")
+        zip_path = os.path.join(folder, "vbcable.zip")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(zip_path, "wb") as f:
+            f.write(r.read())
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(folder)
+        is64 = sys.maxsize > 2**32
+        setup = os.path.join(folder, "VBCABLE_Setup_x64.exe" if is64 else "VBCABLE_Setup.exe")
+        if not os.path.exists(setup):
+            raise RuntimeError("в архиве нет установщика")
+        import ctypes
+        print("Сейчас Windows спросит разрешение — нажми «Да», затем «Install Driver».")
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", setup, None, folder, 1)
+        if rc <= 32:
+            raise RuntimeError("установщик не запустился")
+        print("\nКогда установка закончится, ПЕРЕЗАГРУЗИ компьютер и снова запусти autotune.exe.")
+    except Exception as e:
+        print(f"Автоустановка не удалась ({e}). Открываю сайт — скачай и установи вручную.")
+        webbrowser.open(page)
+
+
 def run_live(args):
     import sounddevice as sd
 
@@ -250,24 +347,55 @@ def run_live(args):
             monitor[0].write(y[:, None].copy())
 
     devices = list(sd.query_devices())
+    settings = load_settings()
     try:
-        inp = resolve_device(devices, args.input, "input")
-        if inp is None:
-            inp = sd.default.device[0]
-            if inp is None or inp < 0:
-                raise LookupError("не найден микрофон по умолчанию, укажи его через -i")
-        api = devices[inp]["hostapi"]
+        default_in = sd.default.device[0]
+        if default_in is None or default_in < 0:
+            mics = [i for i, d in enumerate(devices) if d["max_input_channels"] > 0]
+            if not mics:
+                raise LookupError("в системе нет ни одного микрофона")
+            default_in = mics[0]
+        api = devices[default_in]["hostapi"]
+
         out = resolve_device(devices, args.output, "output", api)
         if out is None:
             out = auto_virtual_cable(devices, api)
         if out is None:
+            print("Не найден виртуальный кабель — без него Discord не увидит автотюн.")
+            if sys.platform == "win32" and interactive() and \
+                    input("Установить VB-Audio Virtual Cable сейчас? [Y/n] ").strip().lower() \
+                    in ("", "y", "д", "yes", "да"):
+                install_vb_cable()
+                return
             raise LookupError("не найден виртуальный кабель (VB-Audio CABLE / BlackHole). "
                               "Установи его и перезагрузи компьютер, или укажи выход через -o")
+
+        inp = None
+        if args.input is not None:
+            inp = resolve_device(devices, args.input, "input", api)
+        elif not args.choose and settings.get("mic"):
+            try:
+                inp = resolve_device(devices, settings["mic"], "input", api)
+            except LookupError:
+                print(f"Сохранённый микрофон «{settings['mic']}» не найден.")
+        if inp is None:
+            inp = choose_mic(devices, api, default_in) if interactive() else default_in
+            settings["mic"] = devices[inp]["name"]
+            save_settings(settings)
         mon_dev = resolve_device(devices, args.monitor, "output", api)
     except LookupError as e:
         print(sd.query_devices())
         sys.exit(f"\nОшибка: {e}")
-    print(f"Микрофон: {devices[inp]['name']}\nВыход:    {devices[out]['name']}")
+
+    out_name = devices[out]["name"]
+    if "CABLE" in out_name:
+        cable_in_discord = "CABLE Output (VB-Audio Virtual Cable)"
+    elif "autotune" in out_name.lower():
+        cable_in_discord = "Monitor of autotune"
+    else:
+        cable_in_discord = out_name
+    print(f"\nМикрофон: {devices[inp]['name']}   (сменить: запусти с --choose)")
+    print(f"В Discord выбери устройство ввода: {cable_in_discord}\n")
 
     try:
         stream = sd.Stream(device=(inp, out), samplerate=sr,
@@ -312,6 +440,8 @@ def main():
     p.add_argument("--list", action="store_true", help="показать аудиоустройства")
     p.add_argument("-i", "--input", type=lambda s: int(s) if s.isdigit() else s,
                    help="микрофон (номер или часть названия)")
+    p.add_argument("--choose", action="store_true",
+                   help="заново выбрать микрофон из списка")
     p.add_argument("-o", "--output", type=lambda s: int(s) if s.isdigit() else s,
                    help="выход: виртуальный кабель (например 'CABLE Input')")
     p.add_argument("-m", "--monitor", type=lambda s: int(s) if s.isdigit() else s,
