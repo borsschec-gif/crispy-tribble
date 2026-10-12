@@ -304,6 +304,10 @@ def run_live(args):
 
 
 def main():
+    # Russian messages must not crash on legacy Windows code pages (cp1252, cp866)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(description="Автотюн для микрофона в реальном времени")
     p.add_argument("--list", action="store_true", help="показать аудиоустройства")
     p.add_argument("-i", "--input", type=lambda s: int(s) if s.isdigit() else s,
