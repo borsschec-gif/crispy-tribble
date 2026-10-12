@@ -683,7 +683,7 @@ PRESETS = {
     "Естественно": {"speed": 0.5, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
     "T-Pain": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
     # Ye "All the Love" (Bully): hard-tuned vocal blended with a talk box
-    "Kanye — All the Love": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.65},
+    "Бабияй": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.65},
     "Чистый ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0},
     "Бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0},
     "Демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0},
