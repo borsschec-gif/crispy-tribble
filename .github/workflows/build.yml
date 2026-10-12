@@ -123,6 +123,22 @@ jobs:
           cat devices.txt
           grep "Autotune Mic" devices.txt
 
+      - name: Smoke test (sound written to Autotune Mic comes out of it, as Discord hears it)
+        run: |
+          python - <<'PY'
+          import numpy as np, sounddevice as sd
+          sr = 48000
+          dev = [i for i, d in enumerate(sd.query_devices()) if "Autotune Mic" in d["name"]][0]
+          t = np.arange(sr) / sr
+          tone = (0.3 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+          rec = sd.playrec(np.column_stack([tone, tone]), sr, channels=1, device=(dev, dev),
+                           dtype="float32", blocking=True)[:, 0]
+          seg = rec[sr // 4:]
+          peak = np.fft.rfftfreq(len(seg), 1 / sr)[np.argmax(np.abs(np.fft.rfft(seg)))]
+          print(f"recorded rms {np.sqrt((seg ** 2).mean()):.3f}, peak {peak:.1f} Hz")
+          assert abs(peak - 440) < 2 and seg.std() > 0.05
+          PY
+
       - name: Package
         run: ditto -c -k --keepParent dist/Autotune.app "Autotune-macOS-${{ matrix.arch }}.zip"
 
