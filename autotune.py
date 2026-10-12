@@ -70,6 +70,22 @@ class PitchDetector:
         tau = below[0] + self.tau_min
         while tau + 1 < self.tau_max and cmndf[tau + 1] < cmndf[tau]:
             tau += 1
+        # a strong upper harmonic (e.g. vowel "i") can make an early, shallower
+        # dip; prefer a clearly deeper minimum shortly after it (not an octave)
+        hi = min(self.tau_max, int(tau * 1.25) + 1)
+        if hi > tau + 1:
+            alt = tau + 1 + int(np.argmin(cmndf[tau + 1:hi]))
+            if cmndf[alt] < cmndf[tau] - 0.05:
+                tau = alt
+        # octave-up error: the real period (2x or 3x longer) repeats much better
+        for mult in (2, 3):
+            lo, hi = tau * mult - 3, tau * mult + 4
+            if hi >= self.tau_max:
+                break
+            alt = lo + int(np.argmin(cmndf[lo:hi]))
+            if cmndf[alt] < cmndf[tau] - 0.08:
+                tau = alt
+                break
         # parabolic interpolation for sub-sample precision
         if 1 <= tau < w - 1:
             a, b, c = cmndf[tau - 1], cmndf[tau], cmndf[tau + 1]
@@ -119,9 +135,77 @@ class PitchShifter:
         return out
 
 
+class TalkBox:
+    """Talk box / vocoder: a synth playing the exact tuned note, shaped by the
+    vowels (spectral envelope) of the voice. Streaming STFT, ~20 ms latency.
+
+    The signal is always delayed by the same amount, so turning the effect
+    on and off does not click.
+    """
+
+    def __init__(self, sr, n_fft=1024, hop=256, lifter=40):
+        self.sr = sr
+        self.n = n_fft
+        self.hop = hop
+        self.lifter = lifter
+        self.win = np.sqrt(np.hanning(n_fft + 1)[:-1])  # sqrt-hann, analysis+synthesis
+        self.norm = 2.0  # sum of hann windows at 75% overlap
+        self.voice = np.zeros(n_fft)
+        self.carrier = np.zeros(n_fft)
+        self.ola = np.zeros(n_fft)
+        self.in_v = np.zeros(0)
+        self.in_c = np.zeros(0)
+        self.out = np.zeros(hop)  # pre-roll so every call can return len(x) samples
+        self.phase = 0.0
+        self.amount = 0.0  # last applied amount, ramped to avoid clicks
+        self.rng = np.random.default_rng(0)
+
+    def _carrier(self, n, freq):
+        if freq <= 0:
+            return self.rng.standard_normal(n) * 0.3  # unvoiced: noise keeps consonants
+        inc = 2 * np.pi * freq / self.sr
+        ph = self.phase + inc * np.arange(1, n + 1)
+        self.phase = ph[-1] % (2 * np.pi)
+        k = np.arange(1, min(60, int(self.sr * 0.45 / freq)) + 1)[:, None]
+        return (np.sin(k * ph) / k).sum(axis=0) * 0.6  # band-limited sawtooth
+
+    def _envelope(self, mag):
+        cep = np.fft.irfft(np.log(mag + 1e-9))
+        cep[self.lifter:-self.lifter + 1] = 0.0
+        return np.exp(np.fft.rfft(cep).real)
+
+    def process(self, x, freq, amount):
+        self.in_v = np.concatenate([self.in_v, x])
+        self.in_c = np.concatenate([self.in_c, self._carrier(len(x), freq)])
+        h, out = self.hop, [self.out]
+        while len(self.in_v) >= h:
+            self.voice = np.concatenate([self.voice[h:], self.in_v[:h]])
+            self.carrier = np.concatenate([self.carrier[h:], self.in_c[:h]])
+            self.in_v, self.in_c = self.in_v[h:], self.in_c[h:]
+            if amount > 0 or self.amount > 0:
+                V = np.fft.rfft(self.voice * self.win)
+                C = np.fft.rfft(self.carrier * self.win)
+                env_v = self._envelope(np.abs(V))
+                env_c = self._envelope(np.abs(C))
+                Y = C * (env_v / env_c)
+                # match the loudness of the voice in this frame
+                Y *= np.sqrt(np.sum(np.abs(V) ** 2) / (np.sum(np.abs(Y) ** 2) + 1e-12))
+                self.ola += np.fft.irfft(Y, self.n) * self.win
+            talk = self.ola[:h] / self.norm
+            self.ola = np.concatenate([self.ola[h:], np.zeros(h)])
+            dry = self.voice[:h]
+            a = np.linspace(self.amount, amount, h, endpoint=False)
+            self.amount = amount
+            # equal-power crossfade: the two signals are mostly uncorrelated
+            out.append(dry * np.sqrt(1 - a) + talk * np.sqrt(a))
+        self.out = np.concatenate(out)
+        y, self.out = self.out[:len(x)], self.out[len(x):]
+        return y
+
+
 class AutoTune:
     def __init__(self, sr, key=0, scale="major", speed=0.8, gate_db=-45.0, mix=1.0,
-                 transpose=0.0):
+                 transpose=0.0, talkbox=0.0):
         self.sr = sr
         self.detector = PitchDetector(sr)
         self.shifter = PitchShifter(sr)
@@ -131,6 +215,8 @@ class AutoTune:
         self.gate = 10 ** (gate_db / 20)
         self.mix = mix
         self.transpose = transpose
+        self.talkbox = talkbox
+        self.tb = TalkBox(sr)
         self.correction = 0.0  # current correction in semitones
         self.f0 = 0.0
 
@@ -180,7 +266,8 @@ class AutoTune:
 
         ratio = 2 ** ((self.correction + self.transpose) / 12)
         wet = self.shifter.process(x, ratio)
-        return wet * self.mix + x * (1 - self.mix)
+        voice = wet * self.mix + x * (1 - self.mix)
+        return self.tb.process(voice, f0 * ratio, float(np.clip(self.talkbox, 0.0, 1.0)))
 
 
 def read_wav(path):
@@ -206,7 +293,8 @@ def process_file(args):
     x, sr = read_wav(args.file[0])
     eff = effective_settings(args, load_settings())
     tuner = AutoTune(sr, key=parse_key(eff["key"]), scale=eff["scale"], speed=eff["speed"],
-                     gate_db=eff["gate"], mix=eff["mix"], transpose=eff["transpose"])
+                     gate_db=eff["gate"], mix=eff["mix"], transpose=eff["transpose"],
+                     talkbox=eff["talkbox"])
     out = np.concatenate([tuner.process(x[i:i + args.block])
                           for i in range(0, len(x), args.block)]) * eff["gain"]
     write_wav(args.file[1], out, sr)
@@ -338,7 +426,8 @@ def install_vb_cable(say=print):
 
 
 DEFAULTS = {"key": "C", "scale": "chromatic", "speed": 0.9, "transpose": 0.0,
-            "mix": 1.0, "gain": 1.0, "gate": -45.0, "enabled": True}
+            "mix": 1.0, "talkbox": 0.0, "gain": 1.0, "gate": -45.0,
+            "enabled": True}
 
 
 def effective_settings(args, settings):
@@ -370,7 +459,7 @@ class Engine:
         self.block = block
         self.tuner = AutoTune(sr, key=parse_key(eff["key"]), scale=eff["scale"],
                               speed=eff["speed"], gate_db=eff["gate"], mix=eff["mix"],
-                              transpose=eff["transpose"])
+                              transpose=eff["transpose"], talkbox=eff["talkbox"])
         self.gain = eff["gain"]
         self.enabled = eff["enabled"]
         self.level = 0.0
@@ -521,25 +610,54 @@ SCALE_LABELS = {
     "blues": "Блюз",
 }
 
+# shown in the sidebar like Discord text channels
 PRESETS = {
-    "Естественно": {"speed": 0.5, "transpose": 0.0, "mix": 1.0},
-    "Робот (T-Pain)": {"speed": 1.0, "transpose": 0.0, "mix": 1.0},
-    "Бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0},
-    "Демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0},
-    "Сброс": {"speed": 0.9, "transpose": 0.0, "mix": 1.0, "gain": 1.0, "gate": -45.0},
+    "естественно": {"speed": 0.5, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
+    "t-pain": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
+    # Ye "All the Love" (Bully): hard-tuned vocal blended with a talk box
+    "kanye-all-the-love": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.65},
+    "чистый-ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0},
+    "бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0},
+    "демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0},
+    "сброс": {"speed": 0.9, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0, "gain": 1.0,
+              "gate": -45.0},
 }
+
+# Discord dark theme
+C_RAIL = "#1e1f22"
+C_SIDE = "#2b2d31"
+C_MAIN = "#313338"
+C_CARD = "#2b2d31"
+C_PANEL = "#232428"
+C_INPUT = "#1e1f22"
+C_HOVER = "#35373c"
+C_SELECTED = "#404249"
+C_TEXT = "#f2f3f5"
+C_MUTED = "#b5bac1"
+C_FAINT = "#949ba4"
+C_BLURPLE = "#5865f2"
+C_BLURPLE_HOVER = "#4752c4"
+C_GREEN = "#23a55a"
+C_RED = "#f23f43"
 
 
 def run_gui(args):
-    """Settings window: every change applies immediately, without restarting."""
-    import tkinter as tk
-    from tkinter import messagebox, ttk
+    """Discord-styled settings window; every change applies immediately."""
+    from tkinter import messagebox
 
+    import customtkinter as ctk
     import sounddevice as sd
 
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")
+    root = ctk.CTk(fg_color=C_MAIN)
     root.title("Автотюн для Discord")
-    root.resizable(False, False)
+    root.geometry("1000x720")
+    root.minsize(860, 560)
+
+    family = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
+
+    def font(size, weight="normal"):
+        return ctk.CTkFont(family=family, size=size, weight=weight)
 
     settings = load_settings()
     try:
@@ -572,153 +690,7 @@ def run_gui(args):
         inp = default_in
     if inp not in mics:
         mics.insert(0, inp)
-
-    pad = {"padx": 10, "pady": 4}
-    frm = ttk.Frame(root, padding=10)
-    frm.grid()
-    row = 0
-
-    def label(text):
-        ttk.Label(frm, text=text).grid(row=row, column=0, sticky="w", **pad)
-
-    # --- microphone
-    label("Микрофон")
-    mic_var = tk.StringVar(value=devices[inp]["name"])
-    mic_box = ttk.Combobox(frm, textvariable=mic_var, state="readonly", width=42,
-                           values=[devices[i]["name"] for i in mics])
-    mic_box.grid(row=row, column=1, columnspan=2, sticky="we", **pad)
-    row += 1
-
-    def open_mic(index):
-        try:
-            engine.start(index, out, mon)
-            settings["mic"] = devices[index]["name"]
-            schedule_save()
-            return True
-        except Exception as e:
-            messagebox.showerror("Автотюн", f"Не удалось открыть микрофон:\n{e}")
-            return False
-
-    mic_box.bind("<<ComboboxSelected>>", lambda e: open_mic(mics[mic_box.current()]))
-
-    # --- on/off
-    enabled_var = tk.BooleanVar(value=engine.enabled)
-
-    def on_enabled():
-        engine.enabled = enabled_var.get()
-        settings["enabled"] = engine.enabled
-        schedule_save()
-
-    ttk.Checkbutton(frm, text="Автотюн включён", variable=enabled_var,
-                    command=on_enabled).grid(row=row, column=1, sticky="w", **pad)
-    row += 1
-
-    # --- key and scale
-    label("Тональность")
-    key_var = tk.StringVar(value=eff["key"])
-    key_box = ttk.Combobox(frm, textvariable=key_var, state="readonly", width=6,
-                           values=NOTE_NAMES)
-    key_box.grid(row=row, column=1, sticky="w", **pad)
-    row += 1
-    label("Лад")
-    scale_keys = list(SCALE_LABELS)
-    scale_box = ttk.Combobox(frm, state="readonly", width=34,
-                             values=[SCALE_LABELS[k] for k in scale_keys])
-    scale_box.current(scale_keys.index(eff["scale"]))
-    scale_box.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
-    row += 1
-
-    def on_scale(_=None):
-        settings["key"] = key_var.get()
-        settings["scale"] = scale_keys[scale_box.current()]
-        tuner.set_scale(parse_key(settings["key"]), settings["scale"])
-        schedule_save()
-
-    key_box.bind("<<ComboboxSelected>>", on_scale)
-    scale_box.bind("<<ComboboxSelected>>", on_scale)
-
-    # --- sliders: (setting, title, min, max, to_ui, from_ui, fmt, apply)
-    def set_speed(v): tuner.speed = v
-    def set_transpose(v): tuner.transpose = v
-    def set_mix(v): tuner.mix = v
-    def set_gain(v): engine.gain = v
-    def set_gate(v): tuner.gate_db = v
-
-    slider_defs = [
-        ("speed", "Скорость подтяжки", 0, 100, lambda v: v * 100, lambda u: u / 100,
-         lambda v: f"{v * 100:.0f}%", set_speed),
-        ("transpose", "Сдвиг высоты", -12, 12, lambda v: v, lambda u: float(round(u)),
-         lambda v: f"{v:+.0f} пт", set_transpose),
-        ("mix", "Сила эффекта", 0, 100, lambda v: v * 100, lambda u: u / 100,
-         lambda v: f"{v * 100:.0f}%", set_mix),
-        ("gain", "Громкость", 0, 200, lambda v: v * 100, lambda u: u / 100,
-         lambda v: f"{v * 100:.0f}%", set_gain),
-        ("gate", "Порог шума", -70, -20, lambda v: v, lambda u: float(round(u)),
-         lambda v: f"{v:.0f} дБ", set_gate),
-    ]
-    sliders = {}
-    for key, title, lo, hi, to_ui, from_ui, fmt, apply in slider_defs:
-        label(title)
-        var = tk.DoubleVar(value=to_ui(eff[key]))
-        val_lbl = ttk.Label(frm, text=fmt(eff[key]), width=8)
-
-        def on_move(_=None, key=key, var=var, from_ui=from_ui, fmt=fmt, apply=apply,
-                    val_lbl=val_lbl):
-            v = from_ui(var.get())
-            apply(v)
-            val_lbl.config(text=fmt(v))
-            settings[key] = v
-            schedule_save()
-
-        ttk.Scale(frm, from_=lo, to=hi, variable=var, length=260,
-                  command=on_move).grid(row=row, column=1, sticky="we", **pad)
-        val_lbl.grid(row=row, column=2, sticky="w", **pad)
-        sliders[key] = (var, to_ui, on_move)
-        row += 1
-
-    # --- presets
-    label("Пресеты")
-    pres = ttk.Frame(frm)
-    pres.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
-    row += 1
-
-    def apply_preset(values):
-        for k, v in values.items():
-            var, to_ui, on_move = sliders[k]
-            var.set(to_ui(v))
-            on_move()
-
-    for name, values in PRESETS.items():
-        ttk.Button(pres, text=name, command=lambda v=values: apply_preset(v)).pack(
-            side="left", padx=2)
-
-    # --- live status
-    ttk.Separator(frm).grid(row=row, column=0, columnspan=3, sticky="we", pady=8)
-    row += 1
-    note_lbl = ttk.Label(frm, text="—", font=("Segoe UI", 20, "bold"), width=6)
-    note_lbl.grid(row=row, column=0, rowspan=2, **pad)
-    info_lbl = ttk.Label(frm, text="")
-    info_lbl.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
-    row += 1
-    meter = ttk.Progressbar(frm, length=300, maximum=1.0)
-    meter.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
-    row += 1
-    ttk.Label(frm, text="В Discord выбери микрофон:  "
-              + discord_device_name(devices[out]["name"]),
-              foreground="#1a7f37").grid(row=row, column=0, columnspan=3, sticky="w", **pad)
-
-    def refresh():
-        f0 = tuner.f0
-        if f0 > 0 and engine.enabled:
-            midi = 69 + 12 * np.log2(f0 / 440)
-            n = int(round(midi + tuner.correction))
-            note_lbl.config(text=f"{NOTE_NAMES[n % 12]}{n // 12 - 1}")
-            info_lbl.config(text=f"{f0:.0f} Гц, подтяжка {tuner.correction:+.2f} пт")
-        else:
-            note_lbl.config(text="—")
-            info_lbl.config(text="" if engine.enabled else "автотюн выключен — голос без обработки")
-        meter["value"] = min(1.0, engine.level)
-        root.after(100, refresh)
+    mic_names = [devices[i]["name"] for i in mics]
 
     save_job = [None]
 
@@ -727,12 +699,300 @@ def run_gui(args):
             root.after_cancel(save_job[0])
         save_job[0] = root.after(500, lambda: save_settings(settings))
 
+    root.grid_columnconfigure(2, weight=1)
+    root.grid_rowconfigure(0, weight=1)
+
+    # ---------- server rail ----------
+    rail = ctk.CTkFrame(root, width=72, corner_radius=0, fg_color=C_RAIL)
+    rail.grid(row=0, column=0, sticky="ns")
+    rail.grid_propagate(False)
+    ctk.CTkLabel(rail, text="AT", width=48, height=48, corner_radius=16, fg_color=C_BLURPLE,
+                 text_color="white", font=font(16, "bold")).pack(pady=(12, 8))
+    ctk.CTkFrame(rail, width=32, height=2, fg_color=C_SELECTED).pack()
+
+    # ---------- channel sidebar ----------
+    side = ctk.CTkFrame(root, width=240, corner_radius=0, fg_color=C_SIDE)
+    side.grid(row=0, column=1, sticky="ns")
+    side.grid_propagate(False)
+    side.grid_rowconfigure(2, weight=1)
+    side.grid_columnconfigure(0, weight=1)
+
+    head = ctk.CTkFrame(side, height=48, corner_radius=0, fg_color=C_SIDE)
+    head.grid(row=0, column=0, sticky="we")
+    head.pack_propagate(False)
+    ctk.CTkLabel(head, text="Автотюн", font=font(15, "bold"), text_color=C_TEXT,
+                 anchor="w").pack(side="left", padx=16)
+    ctk.CTkFrame(side, height=1, corner_radius=0, fg_color=C_RAIL).grid(row=1, column=0,
+                                                                         sticky="nwe")
+
+    channels = ctk.CTkFrame(side, fg_color="transparent")
+    channels.grid(row=2, column=0, sticky="nwe", padx=8, pady=(16, 0))
+    ctk.CTkLabel(channels, text="ПРЕСЕТЫ", font=font(11, "bold"), text_color=C_FAINT,
+                 anchor="w").pack(fill="x", padx=8, pady=(0, 4))
+
+    preset_buttons = {}
+
+    def highlight_preset(name):
+        for n, b in preset_buttons.items():
+            sel = n == name
+            b.configure(fg_color=C_SELECTED if sel else "transparent",
+                        text_color=C_TEXT if sel else C_FAINT)
+        settings["preset"] = name
+        schedule_save()
+
+    # ---------- user panel (bottom of sidebar) ----------
+    panel = ctk.CTkFrame(side, height=56, corner_radius=0, fg_color=C_PANEL)
+    panel.grid(row=3, column=0, sticky="we")
+    panel.grid_propagate(False)
+    panel.grid_columnconfigure(1, weight=1)
+    avatar = ctk.CTkLabel(panel, text="♪", width=32, height=32, corner_radius=16,
+                          fg_color=C_BLURPLE, text_color="white", font=font(16, "bold"))
+    avatar.grid(row=0, column=0, rowspan=2, padx=(10, 8), pady=11)
+    panel_title = ctk.CTkLabel(panel, text="—", font=font(13, "bold"), text_color=C_TEXT,
+                               anchor="w", height=16)
+    panel_title.grid(row=0, column=1, sticky="sw", pady=(10, 0))
+    panel_status = ctk.CTkLabel(panel, text="", font=font(11), text_color=C_FAINT,
+                                anchor="w", height=14)
+    panel_status.grid(row=1, column=1, sticky="nw", pady=(0, 10))
+    mute_btn = ctk.CTkButton(panel, text="🎙", width=32, height=32, corner_radius=4,
+                             fg_color="transparent", hover_color=C_HOVER, font=font(16))
+    mute_btn.grid(row=0, column=2, rowspan=2, padx=8)
+
+    # ---------- main area ----------
+    main = ctk.CTkFrame(root, corner_radius=0, fg_color=C_MAIN)
+    main.grid(row=0, column=2, sticky="nsew")
+    main.grid_columnconfigure(0, weight=1)
+    main.grid_rowconfigure(2, weight=1)
+    top = ctk.CTkFrame(main, height=48, corner_radius=0, fg_color=C_MAIN)
+    top.grid(row=0, column=0, sticky="we")
+    top.pack_propagate(False)
+    ctk.CTkLabel(top, text="#", font=font(22), text_color=C_FAINT).pack(side="left",
+                                                                        padx=(16, 6))
+    ctk.CTkLabel(top, text="настройки-голоса", font=font(15, "bold"),
+                 text_color=C_TEXT).pack(side="left")
+    ctk.CTkFrame(top, width=1, height=24, fg_color=C_SELECTED).pack(side="left", padx=12)
+    ctk.CTkLabel(top, text="Все изменения применяются сразу, прямо во время звонка",
+                 font=font(12), text_color=C_FAINT).pack(side="left")
+    ctk.CTkFrame(main, height=1, corner_radius=0, fg_color=C_RAIL).grid(row=1, column=0,
+                                                                         sticky="we")
+
+    body = ctk.CTkScrollableFrame(main, fg_color=C_MAIN, corner_radius=0,
+                                  scrollbar_button_color=C_RAIL)
+    body.grid(row=2, column=0, sticky="nsew")
+    body.grid_columnconfigure(0, weight=1)
+
+    def card(title, row):
+        frame = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=8)
+        frame.grid(row=row, column=0, sticky="we", padx=16, pady=(16 if row == 0 else 0, 12))
+        frame.grid_columnconfigure(1, weight=1)
+        if title:
+            ctk.CTkLabel(frame, text=title, font=font(11, "bold"), text_color=C_FAINT,
+                         anchor="w").grid(row=0, column=0, columnspan=3, sticky="w",
+                                          padx=16, pady=(12, 4))
+        return frame
+
+    # --- live card: note, level, master switch
+    live = card(None, 0)
+    note_lbl = ctk.CTkLabel(live, text="—", font=font(44, "bold"), text_color=C_TEXT,
+                            width=120)
+    note_lbl.grid(row=0, column=0, rowspan=2, padx=(16, 8), pady=14)
+    info_lbl = ctk.CTkLabel(live, text="Спой что-нибудь", font=font(13), text_color=C_MUTED,
+                            anchor="w")
+    info_lbl.grid(row=0, column=1, sticky="sw", pady=(18, 2))
+    meter = ctk.CTkProgressBar(live, height=8, corner_radius=4, fg_color=C_INPUT,
+                               progress_color=C_GREEN)
+    meter.grid(row=1, column=1, sticky="we", pady=(2, 18))
+    meter.set(0)
+    enabled_var = ctk.BooleanVar(value=engine.enabled)
+    switch = ctk.CTkSwitch(live, text="Автотюн", variable=enabled_var, font=font(13, "bold"),
+                           text_color=C_TEXT, progress_color=C_GREEN,
+                           button_color="white", button_hover_color="#e3e5e8",
+                           fg_color="#80848e", switch_width=44, switch_height=22)
+    switch.grid(row=0, column=2, rowspan=2, padx=20)
+
+    def set_enabled(value):
+        enabled_var.set(value)
+        engine.enabled = value
+        settings["enabled"] = value
+        mute_btn.configure(text_color=C_TEXT if value else C_RED)
+        schedule_save()
+
+    switch.configure(command=lambda: set_enabled(enabled_var.get()))
+    mute_btn.configure(command=lambda: set_enabled(not engine.enabled))
+
+    # --- devices
+    dev = card("УСТРОЙСТВА", 1)
+
+    def option_menu(parent, values, command, width):
+        return ctk.CTkOptionMenu(parent, values=values, command=command, width=width,
+                                 height=36, corner_radius=4, font=font(13),
+                                 fg_color=C_INPUT, button_color=C_INPUT,
+                                 button_hover_color=C_HOVER, text_color=C_TEXT,
+                                 dropdown_fg_color="#111214", dropdown_hover_color=C_BLURPLE,
+                                 dropdown_text_color=C_TEXT, dropdown_font=font(13),
+                                 dynamic_resizing=False)
+
+    def open_mic(index):
+        try:
+            engine.start(index, out, mon)
+            settings["mic"] = devices[index]["name"]
+            schedule_save()
+        except Exception as e:
+            messagebox.showerror("Автотюн", f"Не удалось открыть микрофон:\n{e}")
+
+    ctk.CTkLabel(dev, text="Микрофон", font=font(13), text_color=C_MUTED,
+                 anchor="w").grid(row=1, column=0, sticky="w", padx=16, pady=6)
+    mic_menu = option_menu(dev, mic_names, lambda name: open_mic(mics[mic_names.index(name)]),
+                           420)
+    mic_menu.set(devices[inp]["name"])
+    mic_menu.grid(row=1, column=1, sticky="w", padx=(0, 16), pady=6)
+    hint = ctk.CTkFrame(dev, fg_color="transparent")
+    hint.grid(row=2, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 14))
+    ctk.CTkLabel(hint, text="●", text_color=C_GREEN, font=font(12)).pack(side="left")
+    ctk.CTkLabel(hint, text="  В Discord выбери микрофон:  ", font=font(13),
+                 text_color=C_MUTED).pack(side="left")
+    ctk.CTkLabel(hint, text=discord_device_name(devices[out]["name"]), font=font(13, "bold"),
+                 text_color=C_TEXT).pack(side="left")
+
+    # --- key and scale
+    ks = card("ТОНАЛЬНОСТЬ", 2)
+
+    def on_scale(_=None):
+        settings["key"] = key_seg.get()
+        settings["scale"] = scale_keys[scale_names.index(scale_menu.get())]
+        tuner.set_scale(parse_key(settings["key"]), settings["scale"])
+        schedule_save()
+
+    key_seg = ctk.CTkSegmentedButton(ks, values=NOTE_NAMES, command=on_scale, height=32,
+                                     font=font(13, "bold"), corner_radius=4,
+                                     fg_color=C_INPUT, unselected_color=C_INPUT,
+                                     unselected_hover_color=C_HOVER,
+                                     selected_color=C_BLURPLE,
+                                     selected_hover_color=C_BLURPLE_HOVER,
+                                     text_color=C_TEXT)
+    key_seg.set(eff["key"])
+    key_seg.grid(row=1, column=0, columnspan=3, sticky="we", padx=16, pady=6)
+    ctk.CTkLabel(ks, text="Лад", font=font(13), text_color=C_MUTED,
+                 anchor="w").grid(row=2, column=0, sticky="w", padx=16, pady=(6, 14))
+    scale_keys = list(SCALE_LABELS)
+    scale_names = [SCALE_LABELS[k] for k in scale_keys]
+    scale_menu = option_menu(ks, scale_names, on_scale, 320)
+    scale_menu.set(SCALE_LABELS[eff["scale"]])
+    scale_menu.grid(row=2, column=1, sticky="w", padx=(0, 16), pady=(6, 14))
+
+    # --- sound sliders
+    snd = card("ЗВУК", 3)
+
+    def set_speed(v): tuner.speed = v
+    def set_transpose(v): tuner.transpose = v
+    def set_mix(v): tuner.mix = v
+    def set_talkbox(v): tuner.talkbox = v
+    def set_gain(v): engine.gain = v
+    def set_gate(v): tuner.gate_db = v
+
+    def pct(v):
+        return f"{v * 100:.0f}%"
+
+    # (setting, title, hint, min, max, steps, to_ui, from_ui, fmt, apply)
+    slider_defs = [
+        ("speed", "Скорость подтяжки", "100% — роботизированный эффект", 0, 100, 100,
+         lambda v: v * 100, lambda u: u / 100, pct, set_speed),
+        ("talkbox", "Ток-бокс", "синтезатор, который «поёт» твоими гласными", 0, 100, 100,
+         lambda v: v * 100, lambda u: u / 100, pct, set_talkbox),
+        ("transpose", "Сдвиг высоты", "в полутонах, 12 = октава", -12, 12, 24,
+         lambda v: v, lambda u: float(round(u)), lambda v: f"{v:+.0f}", set_transpose),
+        ("mix", "Сила эффекта", "смесь с чистым голосом", 0, 100, 100,
+         lambda v: v * 100, lambda u: u / 100, pct, set_mix),
+        ("gain", "Громкость", "", 0, 200, 200,
+         lambda v: v * 100, lambda u: u / 100, pct, set_gain),
+        ("gate", "Порог шума", "тише этого — без обработки", -70, -20, 50,
+         lambda v: v, lambda u: float(round(u)), lambda v: f"{v:.0f} дБ", set_gate),
+    ]
+    sliders = {}
+    for r, (key, title, hint_text, lo, hi, steps, to_ui, from_ui, fmt, apply) in \
+            enumerate(slider_defs, start=1):
+        last = r == len(slider_defs)
+        labels = ctk.CTkFrame(snd, fg_color="transparent")
+        labels.grid(row=r, column=0, sticky="w", padx=16, pady=(6, 14 if last else 6))
+        ctk.CTkLabel(labels, text=title, font=font(13), text_color=C_TEXT, anchor="w",
+                     height=18).pack(anchor="w")
+        if hint_text:
+            ctk.CTkLabel(labels, text=hint_text, font=font(11), text_color=C_FAINT,
+                         anchor="w", height=14).pack(anchor="w")
+        val_lbl = ctk.CTkLabel(snd, text=fmt(eff[key]), font=font(13, "bold"),
+                               text_color=C_TEXT, width=64, anchor="e")
+        val_lbl.grid(row=r, column=2, padx=(8, 16), pady=(6, 14 if last else 6))
+
+        def on_move(value, key=key, from_ui=from_ui, fmt=fmt, apply=apply, val_lbl=val_lbl,
+                    manual=True):
+            v = from_ui(value)
+            apply(v)
+            val_lbl.configure(text=fmt(v))
+            settings[key] = v
+            if manual:
+                highlight_preset(None)
+            schedule_save()
+
+        slider = ctk.CTkSlider(snd, from_=lo, to=hi, number_of_steps=steps, height=18,
+                               command=on_move, fg_color=C_INPUT, progress_color=C_BLURPLE,
+                               button_color="white", button_hover_color="#e3e5e8")
+        slider.set(to_ui(eff[key]))
+        slider.grid(row=r, column=1, sticky="we", pady=(6, 14 if last else 6))
+        sliders[key] = (slider, to_ui, on_move)
+
+    def apply_preset(name):
+        for k, v in PRESETS[name].items():
+            slider, to_ui, on_move = sliders[k]
+            slider.set(to_ui(v))
+            on_move(slider.get(), manual=False)
+        highlight_preset(None if name == "сброс" else name)
+
+    for name in PRESETS:
+        b = ctk.CTkButton(channels, text=f"#  {name}", anchor="w", height=34, corner_radius=4,
+                          fg_color="transparent", hover_color=C_HOVER, text_color=C_FAINT,
+                          font=font(14), command=lambda n=name: apply_preset(n))
+        b.pack(fill="x", pady=1)
+        preset_buttons[name] = b
+    highlight_preset(settings.get("preset") if settings.get("preset") in PRESETS else None)
+
+    # ---------- live updates ----------
+    shown = {}
+
+    def show(widget, **kw):
+        if shown.get(widget) != kw:
+            shown[widget] = kw
+            widget.configure(**kw)
+
+    def refresh():
+        f0 = tuner.f0
+        if not engine.enabled:
+            show(note_lbl, text="—", text_color=C_FAINT)
+            show(info_lbl, text="Автотюн выключен — голос идёт без обработки")
+            show(panel_title, text="Без эффекта")
+            show(panel_status, text="выключено", text_color=C_RED)
+        elif f0 > 0:
+            midi = 69 + 12 * np.log2(f0 / 440)
+            n = int(round(midi + tuner.correction))
+            name = f"{NOTE_NAMES[n % 12]}{n // 12 - 1}"
+            show(note_lbl, text=name, text_color=C_TEXT)
+            show(info_lbl, text=f"{f0:.0f} Гц   ·   подтяжка {tuner.correction:+.2f} пт")
+            show(panel_title, text=name)
+            show(panel_status, text="в эфире", text_color=C_GREEN)
+        else:
+            show(note_lbl, text="—", text_color=C_FAINT)
+            show(info_lbl, text="Спой что-нибудь")
+            show(panel_title, text="Автотюн")
+            show(panel_status, text="в эфире", text_color=C_GREEN)
+        meter.set(min(1.0, engine.level))
+        root.after(80, refresh)
+
     def on_close():
         save_settings(settings)
         engine.stop()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    set_enabled(engine.enabled)
     open_mic(inp)
     refresh()
     root.mainloop()
@@ -762,6 +1022,8 @@ def main():
     p.add_argument("--transpose", type=float,
                    help="сдвиг в полутонах (например 12 или -5)")
     p.add_argument("--mix", type=float, help="0..1, доля обработанного звука")
+    p.add_argument("--talkbox", type=float,
+                   help="0..1, эффект ток-бокса (синтезатор, который «говорит» твоим голосом)")
     p.add_argument("--gain", type=float, help="громкость на выходе")
     p.add_argument("--gate", type=float,
                    help="порог тишины в дБ (ниже — без обработки)")
@@ -782,9 +1044,9 @@ def main():
         return
     if not args.nogui:
         try:
-            import tkinter  # noqa: F401
+            import customtkinter  # noqa: F401
         except ImportError:
-            print("Окно недоступно (нет tkinter), работаю в консоли.")
+            print("Окно недоступно (нет customtkinter), работаю в консоли.")
         else:
             run_gui(args)
             return

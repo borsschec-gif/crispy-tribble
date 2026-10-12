@@ -25,6 +25,7 @@ jobs:
         run: >
           pyinstaller --onefile --windowed --name autotune
           --collect-all _sounddevice_data
+          --collect-all customtkinter
           autotune.py
 
       - name: Smoke test
@@ -35,7 +36,7 @@ jobs:
           sr=48000; t=np.arange(sr)/sr
           x=(0.3*np.sin(2*np.pi*225*t)*32767).astype('<i2')
           f=wave.open('test_in.wav','wb'); f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr); f.writeframes(x.tobytes()); f.close()"
-          ./dist/autotune.exe --file test_in.wav test_out.wav
+          ./dist/autotune.exe --file test_in.wav test_out.wav --talkbox 0.65 --speed 1
           test -s test_out.wav
 
       - name: Package
