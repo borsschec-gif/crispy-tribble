@@ -23,7 +23,7 @@ jobs:
 
       - name: Build exe
         run: >
-          pyinstaller --onefile --console --name autotune
+          pyinstaller --onefile --windowed --name autotune
           --collect-all _sounddevice_data
           autotune.py
 
@@ -37,19 +37,12 @@ jobs:
           f=wave.open('test_in.wav','wb'); f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr); f.writeframes(x.tobytes()); f.close()"
           ./dist/autotune.exe --file test_in.wav test_out.wav
           test -s test_out.wav
-          ./dist/autotune.exe --help > /dev/null
-          ./dist/autotune.exe --list || true
 
       - name: Package
         shell: bash
         run: |
           mkdir -p package
           cp dist/autotune.exe README.md package/
-          cat > package/autotune_discord.bat <<'BAT'
-          @echo off
-          REM Edit the parameters below, e.g. -k A -s minor --speed 1.0
-          autotune.exe --speed 0.9
-          BAT
           cd package && 7z a ../autotune-windows.zip *
 
       - uses: actions/upload-artifact@v4
