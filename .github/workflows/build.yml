@@ -1,0 +1,154 @@
+name: Build Windows and macOS apps
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --windowed --name autotune
+          --collect-all _sounddevice_data
+          --collect-all customtkinter
+          autotune.py
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          python -c "
+          import numpy as np, wave
+          sr=48000; t=np.arange(sr)/sr
+          x=(0.3*np.sin(2*np.pi*225*t)*32767).astype('<i2')
+          f=wave.open('test_in.wav','wb'); f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr); f.writeframes(x.tobytes()); f.close()"
+          ./dist/autotune.exe --file test_in.wav test_out.wav --talkbox 0.65 --speed 1
+          test -s test_out.wav
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p package
+          cp dist/autotune.exe README.md package/
+          cd package && 7z a ../autotune-windows.zip *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            autotune-windows.zip
+            dist/autotune.exe
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: AppleSilicon
+          - runner: macos-15-intel
+            arch: Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      # Our own virtual microphone: BlackHole (GPL-3.0) built under the name "Autotune Mic"
+      - name: Build "Autotune Mic" driver
+        run: |
+          git clone --depth 1 --branch v0.7.2 https://github.com/ExistentialAudio/BlackHole bh
+          xcodebuild -project bh/BlackHole.xcodeproj -configuration Release -target BlackHole \
+            CONFIGURATION_BUILD_DIR="$PWD/driver-build" \
+            PRODUCT_BUNDLE_IDENTIFIER=com.autotune.mic \
+            CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" \
+            ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            GCC_PREPROCESSOR_DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS kDriver_Name=\"Autotune\" kHas_Driver_Name_Format=false kDevice_Name=\"Autotune\ Mic\" kPlugIn_BundleID=\"com.autotune.mic\" kManufacturer_Name=\"Autotune\"' \
+            | tail -5
+          mv driver-build/BlackHole.driver AutotuneMic.driver
+          codesign --verify --verbose AutotuneMic.driver
+          lipo -info AutotuneMic.driver/Contents/MacOS/*
+
+      - name: Build app
+        run: |
+          pyinstaller --windowed --name Autotune --osx-bundle-identifier com.autotune.app \
+            --collect-all _sounddevice_data --collect-all customtkinter autotune.py
+          APP=dist/Autotune.app
+          cp -R AutotuneMic.driver "$APP/Contents/Resources/"
+          cp bh/LICENSE "$APP/Contents/Resources/AutotuneMic-driver-LICENSE.txt"
+          plutil -insert NSMicrophoneUsageDescription -string \
+            "Автотюн обрабатывает звук с микрофона и передаёт его в Discord." \
+            "$APP/Contents/Info.plist"
+          codesign --force --deep -s - "$APP"
+          codesign --verify --deep --verbose "$APP"
+
+      - name: Smoke test (audio processing)
+        run: |
+          python -c "
+          import numpy as np, wave
+          sr=48000; t=np.arange(sr)/sr
+          x=(0.3*np.sin(2*np.pi*225*t)*32767).astype('<i2')
+          f=wave.open('test_in.wav','wb'); f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr); f.writeframes(x.tobytes()); f.close()"
+          dist/Autotune.app/Contents/MacOS/Autotune --file test_in.wav test_out.wav --talkbox 0.65 --speed 1
+          test -s test_out.wav
+
+      - name: Smoke test (install the virtual mic from the app, as on first run)
+        run: |
+          dist/Autotune.app/Contents/MacOS/Autotune --print-driver-install > install.sh
+          cat install.sh
+          sudo sh install.sh || true
+          for i in $(seq 1 30); do
+            if dist/Autotune.app/Contents/MacOS/Autotune --list | tee devices.txt | grep -q "Autotune Mic"; then break; fi
+            sleep 2
+          done
+          cat devices.txt
+          grep "Autotune Mic" devices.txt
+
+      - name: Package
+        run: ditto -c -k --keepParent dist/Autotune.app "Autotune-macOS-${{ matrix.arch }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: Autotune-macOS-${{ matrix.arch }}.zip
+
+  release:
+    needs: [windows, macos]
+    if: ${{ !cancelled() && needs.windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find artifacts -type f
+          files=$(find artifacts -type f \( -name '*.zip' -o -name '*.exe' \))
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create latest $files --repo "$GITHUB_REPOSITORY" \
+            --title "Автотюн для Discord (Windows и macOS)" \
+            --notes "Windows: autotune.exe (нужен бесплатный VB-Audio Virtual Cable, программа предложит установить). macOS: Autotune-macOS-AppleSilicon.zip (M1–M4) или Autotune-macOS-Intel.zip — со встроенным виртуальным микрофоном «Autotune Mic». Подробности в README." \
+            --target "$GITHUB_SHA"

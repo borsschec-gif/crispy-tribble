@@ -301,7 +301,12 @@ def process_file(args):
     print(f"готово: {args.file[1]}")
 
 
-VIRTUAL_CABLES = ["CABLE Input", "BlackHole", "autotune"]
+# our own macOS device first, then VB-Cable (Windows), BlackHole, a Linux null sink
+VIRTUAL_CABLES = ["Autotune Mic", "CABLE Input", "BlackHole", "autotune"]
+
+# macOS: BlackHole built under our name (see .github/workflows), bundled in the .app
+MAC_DRIVER = "AutotuneMic.driver"
+MAC_HAL_DIR = "/Library/Audio/Plug-Ins/HAL"
 
 
 def resolve_device(devices, query, kind, hostapi=None):
@@ -331,7 +336,7 @@ def auto_virtual_cable(devices, hostapi):
 
 
 # virtual cables and system aliases are not real microphones
-NOT_MICS = ["CABLE Output", "BlackHole", "Monitor of", "Mapper", "Переназначение",
+NOT_MICS = ["CABLE Output", "BlackHole", "Autotune Mic", "Monitor of", "Mapper", "Переназначение",
             "Первичный драйвер", "Primary Sound Capture", "Stereo Mix", "Стерео микшер"]
 
 
@@ -341,7 +346,16 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-SETTINGS_PATH = os.path.join(app_dir(), "autotune_settings.json")
+def settings_dir():
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        # never write inside the signed .app bundle
+        d = os.path.expanduser("~/Library/Application Support/Autotune")
+        os.makedirs(d, exist_ok=True)
+        return d
+    return app_dir()
+
+
+SETTINGS_PATH = os.path.join(settings_dir(), "autotune_settings.json")
 
 
 def load_settings():
@@ -425,6 +439,52 @@ def install_vb_cable(say=print):
         webbrowser.open(page)
 
 
+def bundled_mac_driver():
+    base = getattr(sys, "_MEIPASS", app_dir())
+    # the build puts it in Autotune.app/Contents/Resources; _MEIPASS is Contents/Frameworks
+    for path in (os.path.join(base, "..", "Resources", MAC_DRIVER), os.path.join(base, MAC_DRIVER)):
+        path = os.path.realpath(path)
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def mac_driver_install_script(src):
+    import shlex
+    dst = os.path.join(MAC_HAL_DIR, MAC_DRIVER)
+    return (f"mkdir -p {shlex.quote(MAC_HAL_DIR)} && rm -rf {shlex.quote(dst)} && "
+            f"cp -R {shlex.quote(src)} {shlex.quote(dst)} && "
+            f"xattr -dr com.apple.quarantine {shlex.quote(dst)} ; "
+            "killall -9 coreaudiod")
+
+
+def install_mac_driver(sd, say=print):
+    """Install the bundled 'Autotune Mic' device (asks for the admin password)."""
+    import subprocess
+    import time
+
+    src = bundled_mac_driver()
+    if src is None:
+        say("Виртуальный микрофон не встроен в эту сборку. Установи BlackHole: "
+            "https://existential.audio/blackhole/")
+        return False
+    script = mac_driver_install_script(src).replace("\\", "\\\\").replace('"', '\\"')
+    r = subprocess.run(["osascript", "-e",
+                        f'do shell script "{script}" with administrator privileges'],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        say(f"Установка отменена или не удалась: {r.stderr.strip()}")
+        return False
+    for _ in range(20):  # coreaudiod restarts in a few seconds
+        time.sleep(0.5)
+        sd._terminate()
+        sd._initialize()
+        if auto_virtual_cable(list(sd.query_devices()), None) is not None:
+            return True
+    say("Микрофон установлен, но пока не появился. Перезапусти программу.")
+    return False
+
+
 DEFAULTS = {"key": "C", "scale": "chromatic", "speed": 0.9, "transpose": 0.0,
             "mix": 1.0, "talkbox": 0.0, "gain": 1.0, "gate": -45.0,
             "enabled": True}
@@ -475,7 +535,7 @@ class Engine:
             self.tuner.f0 = 0.0
         y = np.clip(y * self.gain, -1, 1).astype(np.float32)
         self.level = float(np.abs(y).max()) if len(y) else 0.0
-        outdata[:] = y[:, None]
+        outdata[:] = y[:, None]  # broadcast to every output channel
         mon = self.monitor
         if mon is not None:
             try:
@@ -483,10 +543,11 @@ class Engine:
             except Exception:
                 pass
 
-    def start(self, inp, out, mon=None):
+    def start(self, inp, out, mon=None, out_channels=1):
         self.stop()
+        # write the same signal to both channels: some apps only listen to one
         self.stream = self.sd.Stream(device=(inp, out), samplerate=self.sr,
-                                     blocksize=self.block, channels=(1, 1),
+                                     blocksize=self.block, channels=(1, out_channels),
                                      dtype="float32", latency="low", callback=self.callback)
         if mon is not None:
             m = self.sd.OutputStream(device=mon, samplerate=self.sr, channels=1,
@@ -542,6 +603,8 @@ def pick_devices(sd, args, settings):
 def discord_device_name(out_name):
     if "CABLE" in out_name:
         return "CABLE Output (VB-Audio Virtual Cable)"
+    if "autotune mic" in out_name.lower():
+        return "Autotune Mic"
     if "autotune" in out_name.lower():
         return "Monitor of autotune"
     return out_name
@@ -560,6 +623,12 @@ def run_live(args):
             save_settings(settings)
     except CableMissing as e:
         print("Не найден виртуальный кабель — без него Discord не увидит автотюн.")
+        if sys.platform == "darwin" and interactive() and \
+                input("Установить виртуальный микрофон «Autotune Mic»? [Y/n] ").strip().lower() \
+                in ("", "y", "д", "yes", "да"):
+            if install_mac_driver(sd):
+                return run_live(args)
+            sys.exit(1)
         if sys.platform == "win32" and interactive() and \
                 input("Установить VB-Audio Virtual Cable сейчас? [Y/n] ").strip().lower() \
                 in ("", "y", "д", "yes", "да"):
@@ -575,7 +644,7 @@ def run_live(args):
     print(f"\nМикрофон: {devices[inp]['name']}   (сменить: запусти с --choose)")
     print(f"В Discord выбери устройство ввода: {discord_device_name(devices[out]['name'])}\n")
     try:
-        engine.start(inp, out, mon)
+        engine.start(inp, out, mon, min(2, devices[out]["max_output_channels"]))
     except Exception as e:
         sys.exit(f"Не удалось открыть устройства: {e}\n"
                  "Подсказка: укажи номера устройств из одного Host API "
@@ -610,25 +679,22 @@ SCALE_LABELS = {
     "blues": "Блюз",
 }
 
-# shown in the sidebar like Discord text channels
 PRESETS = {
-    "естественно": {"speed": 0.5, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
-    "t-pain": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
+    "Естественно": {"speed": 0.5, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
+    "T-Pain": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
     # Ye "All the Love" (Bully): hard-tuned vocal blended with a talk box
-    "kanye-all-the-love": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.65},
-    "чистый-ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0},
-    "бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0},
-    "демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0},
-    "сброс": {"speed": 0.9, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0, "gain": 1.0,
+    "Kanye — All the Love": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.65},
+    "Чистый ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0},
+    "Бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0},
+    "Демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0},
+    "Сброс": {"speed": 0.9, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0, "gain": 1.0,
               "gate": -45.0},
 }
 
 # Discord dark theme
-C_RAIL = "#1e1f22"
-C_SIDE = "#2b2d31"
+C_LINE = "#1f2023"
 C_MAIN = "#313338"
 C_CARD = "#2b2d31"
-C_PANEL = "#232428"
 C_INPUT = "#1e1f22"
 C_HOVER = "#35373c"
 C_SELECTED = "#404249"
@@ -651,20 +717,41 @@ def run_gui(args):
     ctk.set_appearance_mode("dark")
     root = ctk.CTk(fg_color=C_MAIN)
     root.title("Автотюн для Discord")
-    root.geometry("1000x720")
-    root.minsize(860, 560)
+    root.geometry("780x780")
+    root.minsize(700, 520)
 
-    family = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
+    family = {"win32": "Segoe UI", "darwin": "Helvetica Neue"}.get(sys.platform, "DejaVu Sans")
 
     def font(size, weight="normal"):
         return ctk.CTkFont(family=family, size=size, weight=weight)
 
     settings = load_settings()
     try:
-        devices, api, default_in, inp, out, mon = pick_devices(sd, args, settings)
+        try:
+            devices, api, default_in, inp, out, mon = pick_devices(sd, args, settings)
+        except CableMissing:
+            if sys.platform != "darwin" or bundled_mac_driver() is None:
+                raise
+            root.withdraw()
+            if not messagebox.askyesno(
+                    "Автотюн", "Чтобы Discord услышал автотюн, нужно один раз установить "
+                    "виртуальный микрофон «Autotune Mic».\n\nmacOS попросит пароль "
+                    "администратора. Установить?"):
+                root.destroy()
+                return
+            msgs = []
+            if not install_mac_driver(sd, say=msgs.append):
+                messagebox.showerror("Автотюн", "\n".join(msgs) or "Не удалось установить.")
+                root.destroy()
+                return
+            root.deiconify()
+            devices, api, default_in, inp, out, mon = pick_devices(sd, args, settings)
     except CableMissing:
         root.withdraw()
-        if sys.platform == "win32" and messagebox.askyesno(
+        if sys.platform == "darwin":
+            messagebox.showerror("Автотюн", "Не найден виртуальный микрофон. Установи BlackHole "
+                                 "(existential.audio/blackhole) и запусти программу снова.")
+        elif sys.platform == "win32" and messagebox.askyesno(
                 "Автотюн", "Не найден виртуальный аудиокабель — без него Discord не услышит "
                 "автотюн.\n\nСкачать и установить бесплатный VB-Audio Virtual Cable сейчас?"):
             msgs = []
@@ -699,85 +786,27 @@ def run_gui(args):
             root.after_cancel(save_job[0])
         save_job[0] = root.after(500, lambda: save_settings(settings))
 
-    root.grid_columnconfigure(2, weight=1)
+    root.grid_columnconfigure(0, weight=1)
     root.grid_rowconfigure(0, weight=1)
-
-    # ---------- server rail ----------
-    rail = ctk.CTkFrame(root, width=72, corner_radius=0, fg_color=C_RAIL)
-    rail.grid(row=0, column=0, sticky="ns")
-    rail.grid_propagate(False)
-    ctk.CTkLabel(rail, text="AT", width=48, height=48, corner_radius=16, fg_color=C_BLURPLE,
-                 text_color="white", font=font(16, "bold")).pack(pady=(12, 8))
-    ctk.CTkFrame(rail, width=32, height=2, fg_color=C_SELECTED).pack()
-
-    # ---------- channel sidebar ----------
-    side = ctk.CTkFrame(root, width=240, corner_radius=0, fg_color=C_SIDE)
-    side.grid(row=0, column=1, sticky="ns")
-    side.grid_propagate(False)
-    side.grid_rowconfigure(2, weight=1)
-    side.grid_columnconfigure(0, weight=1)
-
-    head = ctk.CTkFrame(side, height=48, corner_radius=0, fg_color=C_SIDE)
-    head.grid(row=0, column=0, sticky="we")
-    head.pack_propagate(False)
-    ctk.CTkLabel(head, text="Автотюн", font=font(15, "bold"), text_color=C_TEXT,
-                 anchor="w").pack(side="left", padx=16)
-    ctk.CTkFrame(side, height=1, corner_radius=0, fg_color=C_RAIL).grid(row=1, column=0,
-                                                                         sticky="nwe")
-
-    channels = ctk.CTkFrame(side, fg_color="transparent")
-    channels.grid(row=2, column=0, sticky="nwe", padx=8, pady=(16, 0))
-    ctk.CTkLabel(channels, text="ПРЕСЕТЫ", font=font(11, "bold"), text_color=C_FAINT,
-                 anchor="w").pack(fill="x", padx=8, pady=(0, 4))
-
-    preset_buttons = {}
-
-    def highlight_preset(name):
-        for n, b in preset_buttons.items():
-            sel = n == name
-            b.configure(fg_color=C_SELECTED if sel else "transparent",
-                        text_color=C_TEXT if sel else C_FAINT)
-        settings["preset"] = name
-        schedule_save()
-
-    # ---------- user panel (bottom of sidebar) ----------
-    panel = ctk.CTkFrame(side, height=56, corner_radius=0, fg_color=C_PANEL)
-    panel.grid(row=3, column=0, sticky="we")
-    panel.grid_propagate(False)
-    panel.grid_columnconfigure(1, weight=1)
-    avatar = ctk.CTkLabel(panel, text="♪", width=32, height=32, corner_radius=16,
-                          fg_color=C_BLURPLE, text_color="white", font=font(16, "bold"))
-    avatar.grid(row=0, column=0, rowspan=2, padx=(10, 8), pady=11)
-    panel_title = ctk.CTkLabel(panel, text="—", font=font(13, "bold"), text_color=C_TEXT,
-                               anchor="w", height=16)
-    panel_title.grid(row=0, column=1, sticky="sw", pady=(10, 0))
-    panel_status = ctk.CTkLabel(panel, text="", font=font(11), text_color=C_FAINT,
-                                anchor="w", height=14)
-    panel_status.grid(row=1, column=1, sticky="nw", pady=(0, 10))
-    mute_btn = ctk.CTkButton(panel, text="🎙", width=32, height=32, corner_radius=4,
-                             fg_color="transparent", hover_color=C_HOVER, font=font(16))
-    mute_btn.grid(row=0, column=2, rowspan=2, padx=8)
 
     # ---------- main area ----------
     main = ctk.CTkFrame(root, corner_radius=0, fg_color=C_MAIN)
-    main.grid(row=0, column=2, sticky="nsew")
+    main.grid(row=0, column=0, sticky="nsew")
     main.grid_columnconfigure(0, weight=1)
     main.grid_rowconfigure(2, weight=1)
     top = ctk.CTkFrame(main, height=48, corner_radius=0, fg_color=C_MAIN)
     top.grid(row=0, column=0, sticky="we")
     top.pack_propagate(False)
-    ctk.CTkLabel(top, text="#", font=font(22), text_color=C_FAINT).pack(side="left",
-                                                                        padx=(16, 6))
-    ctk.CTkLabel(top, text="настройки-голоса", font=font(15, "bold"),
-                 text_color=C_TEXT).pack(side="left")
+    ctk.CTkLabel(top, text="Автотюн", font=font(15, "bold"),
+                 text_color=C_TEXT).pack(side="left", padx=(16, 0))
     ctk.CTkFrame(top, width=1, height=24, fg_color=C_SELECTED).pack(side="left", padx=12)
     ctk.CTkLabel(top, text="Все изменения применяются сразу, прямо во время звонка",
                  font=font(12), text_color=C_FAINT).pack(side="left")
-    ctk.CTkFrame(main, height=1, corner_radius=0, fg_color=C_RAIL).grid(row=1, column=0,
+    ctk.CTkFrame(main, height=1, corner_radius=0, fg_color=C_LINE).grid(row=1, column=0,
                                                                          sticky="we")
 
     body = ctk.CTkScrollableFrame(main, fg_color=C_MAIN, corner_radius=0,
-                                  scrollbar_button_color=C_RAIL)
+                                  scrollbar_button_color=C_LINE)
     body.grid(row=2, column=0, sticky="nsew")
     body.grid_columnconfigure(0, weight=1)
 
@@ -814,14 +843,29 @@ def run_gui(args):
         enabled_var.set(value)
         engine.enabled = value
         settings["enabled"] = value
-        mute_btn.configure(text_color=C_TEXT if value else C_RED)
         schedule_save()
 
     switch.configure(command=lambda: set_enabled(enabled_var.get()))
-    mute_btn.configure(command=lambda: set_enabled(not engine.enabled))
+
+    # --- presets
+    pre = card("ПРЕСЕТЫ", 1)
+    pre_grid = ctk.CTkFrame(pre, fg_color="transparent")
+    pre_grid.grid(row=1, column=0, columnspan=3, sticky="we", padx=12, pady=(2, 12))
+    for c in range(4):
+        pre_grid.grid_columnconfigure(c, weight=1, uniform="presets")
+    preset_buttons = {}
+
+    def highlight_preset(name):
+        for n, b in preset_buttons.items():
+            sel = n == name
+            b.configure(fg_color=C_BLURPLE if sel else C_INPUT,
+                        hover_color=C_BLURPLE_HOVER if sel else C_HOVER,
+                        text_color="white" if sel else C_MUTED)
+        settings["preset"] = name
+        schedule_save()
 
     # --- devices
-    dev = card("УСТРОЙСТВА", 1)
+    dev = card("УСТРОЙСТВА", 2)
 
     def option_menu(parent, values, command, width):
         return ctk.CTkOptionMenu(parent, values=values, command=command, width=width,
@@ -834,7 +878,7 @@ def run_gui(args):
 
     def open_mic(index):
         try:
-            engine.start(index, out, mon)
+            engine.start(index, out, mon, min(2, devices[out]["max_output_channels"]))
             settings["mic"] = devices[index]["name"]
             schedule_save()
         except Exception as e:
@@ -855,7 +899,7 @@ def run_gui(args):
                  text_color=C_TEXT).pack(side="left")
 
     # --- key and scale
-    ks = card("ТОНАЛЬНОСТЬ", 2)
+    ks = card("ТОНАЛЬНОСТЬ", 3)
 
     def on_scale(_=None):
         settings["key"] = key_seg.get()
@@ -881,7 +925,7 @@ def run_gui(args):
     scale_menu.grid(row=2, column=1, sticky="w", padx=(0, 16), pady=(6, 14))
 
     # --- sound sliders
-    snd = card("ЗВУК", 3)
+    snd = card("ЗВУК", 4)
 
     def set_speed(v): tuner.speed = v
     def set_transpose(v): tuner.transpose = v
@@ -945,13 +989,12 @@ def run_gui(args):
             slider, to_ui, on_move = sliders[k]
             slider.set(to_ui(v))
             on_move(slider.get(), manual=False)
-        highlight_preset(None if name == "сброс" else name)
+        highlight_preset(None if name == "Сброс" else name)
 
-    for name in PRESETS:
-        b = ctk.CTkButton(channels, text=f"#  {name}", anchor="w", height=34, corner_radius=4,
-                          fg_color="transparent", hover_color=C_HOVER, text_color=C_FAINT,
-                          font=font(14), command=lambda n=name: apply_preset(n))
-        b.pack(fill="x", pady=1)
+    for i, name in enumerate(PRESETS):
+        b = ctk.CTkButton(pre_grid, text=name, height=36, corner_radius=4, font=font(13),
+                          command=lambda n=name: apply_preset(n))
+        b.grid(row=i // 4, column=i % 4, sticky="we", padx=4, pady=4)
         preset_buttons[name] = b
     highlight_preset(settings.get("preset") if settings.get("preset") in PRESETS else None)
 
@@ -968,21 +1011,15 @@ def run_gui(args):
         if not engine.enabled:
             show(note_lbl, text="—", text_color=C_FAINT)
             show(info_lbl, text="Автотюн выключен — голос идёт без обработки")
-            show(panel_title, text="Без эффекта")
-            show(panel_status, text="выключено", text_color=C_RED)
         elif f0 > 0:
             midi = 69 + 12 * np.log2(f0 / 440)
             n = int(round(midi + tuner.correction))
             name = f"{NOTE_NAMES[n % 12]}{n // 12 - 1}"
             show(note_lbl, text=name, text_color=C_TEXT)
             show(info_lbl, text=f"{f0:.0f} Гц   ·   подтяжка {tuner.correction:+.2f} пт")
-            show(panel_title, text=name)
-            show(panel_status, text="в эфире", text_color=C_GREEN)
         else:
             show(note_lbl, text="—", text_color=C_FAINT)
             show(info_lbl, text="Спой что-нибудь")
-            show(panel_title, text="Автотюн")
-            show(panel_status, text="в эфире", text_color=C_GREEN)
         meter.set(min(1.0, engine.level))
         root.after(80, refresh)
 
@@ -1031,6 +1068,7 @@ def main():
                    help="работать в консоли без окна настроек")
     p.add_argument("--samplerate", type=int, default=48000)
     p.add_argument("--block", type=int, default=256, help="размер блока (задержка)")
+    p.add_argument("--print-driver-install", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--file", nargs=2, metavar=("IN.wav", "OUT.wav"),
                    help="обработать файл вместо живого звука (для проверки)")
     args = p.parse_args()
@@ -1038,6 +1076,12 @@ def main():
     if args.list:
         import sounddevice as sd
         print(sd.query_devices())
+        return
+    if args.print_driver_install:
+        src = bundled_mac_driver()
+        if src is None:
+            sys.exit("driver not bundled")
+        print(mac_driver_install_script(src))
         return
     if args.file:
         process_file(args)
