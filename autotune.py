@@ -204,6 +204,35 @@ def make_tuner(args, sr):
                     gate_db=args.gate, mix=args.mix, transpose=args.transpose)
 
 
+VIRTUAL_CABLES = ["CABLE Input", "BlackHole", "autotune"]
+
+
+def resolve_device(devices, query, kind, hostapi=None):
+    """Find a device index by number or name substring.
+
+    Windows lists the same device once per host API (MME, WASAPI, ...), so
+    several matches are normal: prefer the one on `hostapi`, else the first.
+    """
+    if query is None or isinstance(query, int):
+        return query
+    key = "max_input_channels" if kind == "input" else "max_output_channels"
+    matches = [i for i, d in enumerate(devices)
+               if query.lower() in d["name"].lower() and d[key] > 0]
+    if not matches:
+        raise LookupError(f"устройство '{query}' не найдено")
+    same_api = [i for i in matches if devices[i]["hostapi"] == hostapi]
+    return (same_api or matches)[0]
+
+
+def auto_virtual_cable(devices, hostapi):
+    for name in VIRTUAL_CABLES:
+        try:
+            return resolve_device(devices, name, "output", hostapi)
+        except LookupError:
+            pass
+    return None
+
+
 def run_live(args):
     import sounddevice as sd
 
@@ -220,17 +249,37 @@ def run_live(args):
         if monitor:
             monitor[0].write(y[:, None].copy())
 
+    devices = list(sd.query_devices())
     try:
-        stream = sd.Stream(device=(args.input, args.output), samplerate=sr,
+        inp = resolve_device(devices, args.input, "input")
+        if inp is None:
+            inp = sd.default.device[0]
+            if inp is None or inp < 0:
+                raise LookupError("не найден микрофон по умолчанию, укажи его через -i")
+        api = devices[inp]["hostapi"]
+        out = resolve_device(devices, args.output, "output", api)
+        if out is None:
+            out = auto_virtual_cable(devices, api)
+        if out is None:
+            raise LookupError("не найден виртуальный кабель (VB-Audio CABLE / BlackHole). "
+                              "Установи его и перезагрузи компьютер, или укажи выход через -o")
+        mon_dev = resolve_device(devices, args.monitor, "output", api)
+    except LookupError as e:
+        print(sd.query_devices())
+        sys.exit(f"\nОшибка: {e}")
+    print(f"Микрофон: {devices[inp]['name']}\nВыход:    {devices[out]['name']}")
+
+    try:
+        stream = sd.Stream(device=(inp, out), samplerate=sr,
                            blocksize=args.block, channels=(1, 1), dtype="float32",
                            latency="low", callback=callback)
     except Exception as e:
         sys.exit(f"Не удалось открыть устройства: {e}\n"
-                 "Подсказка: возьми вход и выход из одного Host API "
-                 "(см. --list), например оба MME или оба WASAPI.")
+                 "Подсказка: укажи номера устройств из одного Host API "
+                 "(см. --list), например -i 1 -o 5.")
 
-    if args.monitor is not None:
-        mon = sd.OutputStream(device=args.monitor, samplerate=sr, channels=1,
+    if mon_dev is not None:
+        mon = sd.OutputStream(device=mon_dev, samplerate=sr, channels=1,
                               dtype="float32", latency="low", blocksize=args.block)
         mon.start()
         monitor.append(mon)
@@ -292,4 +341,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # double-clicked .exe: keep the console open so errors are readable
+        if getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
+            input("\nНажми Enter, чтобы закрыть окно...")

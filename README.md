@@ -8,7 +8,19 @@
 Микрофон -> autotune.py -> виртуальный кабель -> Discord
 ```
 
-## 1. Установка
+## Быстрый старт без Python (Windows)
+
+1. Установи бесплатный [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) и перезагрузи компьютер.
+2. Скачай `autotune.exe` со страницы [Releases](https://github.com/borsschec-gif/crispy-tribble/releases/latest).
+3. Запусти его двойным кликом. Программа сама найдёт микрофон по умолчанию и кабель.
+   Windows может показать окно «Windows защитила ваш компьютер»: нажми «Подробнее» → «Выполнить в любом случае»
+   (у exe нет платной цифровой подписи).
+4. В Discord выбери микрофоном `CABLE Output` (см. раздел 3 ниже).
+
+Чтобы задать настройки, открой `autotune_discord.bat` из архива `autotune-windows.zip` в Блокноте
+и допиши параметры из таблицы ниже, например `autotune.exe -k A -s minor --speed 1.0`.
+
+## 1. Установка (из исходников, с Python)
 
 1. Установи [Python 3.9+](https://www.python.org/downloads/). На Windows при установке включи галочку «Add to PATH».
 2. В папке проекта выполни: `pip install -r requirements.txt`
@@ -22,8 +34,8 @@
 
 ```bash
 python autotune.py --list                      # список устройств
-python autotune.py -o "CABLE Input"            # Windows
-python autotune.py -o "BlackHole"              # macOS
+python autotune.py                             # сам найдёт микрофон и кабель (CABLE / BlackHole)
+python autotune.py -o "CABLE Input"            # указать выход вручную
 python autotune.py -i "USB Mic" -o "CABLE Input" -m "Headphones"   # указать микрофон и слушать себя
 ```
 
