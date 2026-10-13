@@ -188,7 +188,8 @@ jobs:
           dmgbuild -s tools/dmg_settings.py -D app=dist/Autotune.app -D background=dmg_bg.tiff \
             -D icon="$ICNS" "Автотюн" "$DMG"
           hdiutil attach -nobrowse -readonly -mountpoint /tmp/dmg "$DMG"
-          ls -la /tmp/dmg /tmp/dmg/.background
+          ls -la /tmp/dmg
+          test -f /tmp/dmg/.background.tiff
           test -L /tmp/dmg/Applications && test "$(readlink /tmp/dmg/Applications)" = /Applications
           test -f /tmp/dmg/.DS_Store
           codesign --verify --deep --verbose /tmp/dmg/Autotune.app
@@ -203,7 +204,8 @@ jobs:
 
   release:
     needs: [windows, macos]
-    if: ${{ !cancelled() && needs.windows.result == 'success' }}
+    # publish only complete releases: a failed platform must not drop its downloads
+    if: ${{ needs.windows.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
