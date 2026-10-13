@@ -582,11 +582,13 @@ class Engine:
         self.listen_volume = eff["listen_volume"]
         self.level = 0.0
         self.stream = None
-        self.listen = None
+        self.listen = None  # headphones stream (normal mode)
+        self.cable = None  # virtual cable stream (shared mode)
+        self.mode = None  # "normal" | "shared"
         self.io = None  # (mic, virtual cable, cable channels)
         self.listen_cfg = None  # (headphones, channels)
 
-    def callback(self, indata, outdata, frames, time, status):
+    def _process(self, indata):
         x = indata[:, 0]
         if self.enabled:
             y = self.tuner.process(x)
@@ -595,11 +597,25 @@ class Engine:
             self.tuner.f0 = 0.0
         y = np.clip(y * self.gain, -1, 1).astype(np.float32)
         self.level = float(np.abs(y).max()) if len(y) else 0.0
+        return y
+
+    def callback(self, indata, outdata, frames, time, status):
+        """Normal mode: mic -> virtual cable; headphones (if any) via a queue."""
+        y = self._process(indata)
         outdata[:] = y[:, None]  # broadcast to every output channel
         listen = self.listen
         if listen is not None:
             listen.volume = self.listen_volume
             listen.push(y.copy())
+
+    def callback_shared(self, indata, outdata, frames, time, status):
+        """Shared mode (headphones = the mic's device): mic -> headphones directly,
+        virtual cable via a queue."""
+        y = self._process(indata)
+        outdata[:] = (y * self.listen_volume)[:, None]
+        cable = self.cable
+        if cable is not None:
+            cable.push(y.copy())
 
     def start(self, inp, out, mon=None, out_channels=1):
         """(Re)open the mic -> virtual cable stream (e.g. after picking another mic)."""
@@ -618,45 +634,94 @@ class Engine:
                 and self.listen_cfg[0] in self.io[:2])
 
     def _reopen(self, main):
-        """Reopen what changed. When the headphones are the mic's own device (AirPods),
-        macOS refuses to configure a device that is already running ("cannot do in
-        current context") and the late stream stays silent, so then both streams are
-        closed, given a moment to release the device, created while it is idle, and
-        only then started."""
+        """Apply a change of mic or headphones.
+
+        Two PortAudio streams on one CoreAudio device are unreliable (the second
+        one often stays silent), so when the headphones are the mic's own device
+        (AirPods) a single duplex stream serves both, and Discord's virtual cable
+        is fed through a short queue instead.
+        """
         shared = self._shares_device()
-        reopen_main = (main or shared or self.stream is None) and self.io is not None
-        reopen_listen = (not main) or shared or (self.listen is None and self.listen_cfg)
-        closed_shared = shared and (self.stream is not None or self.listen is not None)
-        if reopen_main:
-            self._close_main()
-        if reopen_listen:
+        if not main and not shared and self.mode == "normal" and self.stream is not None:
+            # just the headphones changed, on their own device: leave Discord's stream alone
             self._close_listen()
-        if closed_shared:
-            import time
-            time.sleep(0.15)  # CoreAudio releases a stopped device asynchronously
-        if reopen_main:
-            inp, out, out_channels = self.io
-            # write the same signal to both channels: some apps only listen to one
-            self.stream = self.sd.Stream(device=(inp, out), samplerate=self.sr,
-                                         blocksize=self.block, channels=(1, out_channels),
+            if self.listen_cfg is not None:
+                device, channels = self.listen_cfg
+                try:
+                    self.listen = Listen(self.sd, self.sr, self.block, device, channels)
+                except Exception:
+                    self.listen_cfg = None
+                    raise
+            return
+        if self.io is None:
+            return
+        if main and not shared and self.mode == "normal":
+            # another mic, headphones on their own device: keep them playing
+            self._close_main()
+            mic, cable, cable_channels = self.io
+            self.stream = self.sd.Stream(device=(mic, cable), samplerate=self.sr,
+                                         blocksize=self.block, channels=(1, cable_channels),
                                          dtype="float32", latency="low",
                                          callback=self.callback)
-        listen_error = None
-        if reopen_listen and self.listen_cfg is not None:
+            self.stream.start()
+            if self.listen is None and self.listen_cfg is not None:
+                device, channels = self.listen_cfg
+                try:
+                    self.listen = Listen(self.sd, self.sr, self.block, device, channels)
+                except Exception:
+                    self.listen_cfg = None
+                    raise
+            return
+        was_shared = self.mode == "shared"
+        self.stop()
+        if shared or was_shared:
+            import time
+            time.sleep(0.15)  # CoreAudio releases a stopped device asynchronously
+        try:
+            self._build()
+        except Exception:
+            if self.listen_cfg is None:
+                raise
+            # Discord must keep hearing us even if the headphones fail
+            self.listen_cfg = None
+            self.stop()
+            self._build()
+            self._start_all()
+            raise
+        self._start_all()
+
+    def _build(self):
+        mic, cable, cable_channels = self.io
+        if self._shares_device():
             device, channels = self.listen_cfg
+            self.cable = Listen(self.sd, self.sr, self.block, cable, cable_channels,
+                                start=False)
             try:
+                self.stream = self.sd.Stream(device=(mic, device), samplerate=self.sr,
+                                             blocksize=self.block, channels=(1, channels),
+                                             dtype="float32", latency="low",
+                                             callback=self.callback_shared)
+            except Exception:
+                self._close_cable()
+                raise
+            self.mode = "shared"
+        else:
+            # write the same signal to both channels: some apps only listen to one
+            self.stream = self.sd.Stream(device=(mic, cable), samplerate=self.sr,
+                                         blocksize=self.block, channels=(1, cable_channels),
+                                         dtype="float32", latency="low",
+                                         callback=self.callback)
+            self.mode = "normal"
+            if self.listen_cfg is not None:
+                device, channels = self.listen_cfg
                 self.listen = Listen(self.sd, self.sr, self.block, device, channels,
                                      start=False)
-            except Exception as e:  # Discord must keep hearing us even if headphones fail
-                listen_error, self.listen_cfg = e, None
-        # headphones first: on a shared device CoreAudio accepts the input side
-        # joining a running output, not the other way round
-        if reopen_listen and self.listen is not None:
-            self.listen.start()
-        if reopen_main:
-            self.stream.start()
-        if listen_error is not None:
-            raise listen_error
+
+    def _start_all(self):
+        for out in (self.listen, self.cable):
+            if out is not None:
+                out.start()
+        self.stream.start()
 
     def _close_main(self):
         if self.stream is not None:
@@ -672,9 +737,16 @@ class Engine:
         if old is not None:
             old.close()
 
+    def _close_cable(self):
+        old, self.cable = self.cable, None
+        if old is not None:
+            old.close()
+
     def stop(self):
         self._close_listen()
+        self._close_cable()
         self._close_main()
+        self.mode = None
 
 
 # virtual cables and system aliases are not headphones
