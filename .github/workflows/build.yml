@@ -188,28 +188,33 @@ jobs:
           mic = [i for i, d in enumerate(devs) if "Autotune Mic" in d["name"]][0]
           null = [i for i, d in enumerate(devs) if "Null Audio" in d["name"]
                   and d["max_output_channels"] > 0][0]
-          eff = dict(a.DEFAULTS, enabled=False, gain=1.0, listen_volume=1.0)
-          # loop: headphones play into the mic device, the mic hears it and feeds the
-          # headphones again; a kicked tone keeps circulating only if BOTH streams run
+          eff = dict(a.DEFAULTS, gain=1.0, listen_volume=1.0)
+          # The engine's "effect" is replaced by a steady tone: the mic stream's callback
+          # sends it to the headphones (proves the mic stream runs), the headphones play
+          # it into the mic's own device, and the mic must hear it back (proves the
+          # headphone stream runs). Same device for both = the AirPods case.
           results = []
           for trial in range(6):
               eng = a.Engine(sd, sr, block, eff)
+              heard, pos = [], [0]
+              def fake_effect(x, heard=heard, pos=pos):
+                  heard.append(float(np.sqrt(np.mean(np.square(x)))))
+                  t = (np.arange(len(x)) + pos[0]) / sr
+                  pos[0] += len(x)
+                  return 0.4 * np.sin(2 * np.pi * 330 * t)
+              eng.tuner.process = fake_effect
               if trial % 2 == 0:
                   eng.start(mic, null, out_channels=2); eng.set_listen(mic, 2)   # listen on
               else:
                   eng.set_listen(mic, 2); eng.start(mic, null, out_channels=2)   # mic switch
-              t = np.arange(block * 8) / sr
-              tone = (0.4 * np.sin(2 * np.pi * 330 * t)).astype(np.float32)
-              for k in range(4):
-                  eng.listen.push(tone[k * block:(k + 1) * block])
-              levels = []
-              for _ in range(10):
-                  time.sleep(0.1)
-                  levels.append(eng.level)
+              time.sleep(1.0)
               eng.stop()
-              results.append(min(levels[3:]))
-              print(f"trial {trial}: level after kick {min(levels[3:]):.3f}", flush=True)
-          assert all(r > 0.05 for r in results), results
+              tail = heard[len(heard) // 2:]
+              rms = float(np.median(tail)) if tail else 0.0
+              results.append(rms)
+              print(f"trial {trial}: mic blocks {len(heard)}, heard back rms {rms:.3f} "
+                    f"(expected ~0.28)", flush=True)
+          assert all(r > 0.2 for r in results), results
           PY
 
       # Classic installer: drag the app onto the Applications folder
