@@ -649,10 +649,12 @@ class Engine:
                                      start=False)
             except Exception as e:  # Discord must keep hearing us even if headphones fail
                 listen_error, self.listen_cfg = e, None
-        if reopen_main:
-            self.stream.start()
+        # headphones first: on a shared device CoreAudio accepts the input side
+        # joining a running output, not the other way round
         if reopen_listen and self.listen is not None:
             self.listen.start()
+        if reopen_main:
+            self.stream.start()
         if listen_error is not None:
             raise listen_error
 
