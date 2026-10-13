@@ -621,14 +621,19 @@ class Engine:
         """Reopen what changed. When the headphones are the mic's own device (AirPods),
         macOS refuses to configure a device that is already running ("cannot do in
         current context") and the late stream stays silent, so then both streams are
-        closed, created while the device is idle, and only then started."""
+        closed, given a moment to release the device, created while it is idle, and
+        only then started."""
         shared = self._shares_device()
         reopen_main = (main or shared or self.stream is None) and self.io is not None
         reopen_listen = (not main) or shared or (self.listen is None and self.listen_cfg)
+        closed_shared = shared and (self.stream is not None or self.listen is not None)
         if reopen_main:
             self._close_main()
         if reopen_listen:
             self._close_listen()
+        if closed_shared:
+            import time
+            time.sleep(0.15)  # CoreAudio releases a stopped device asynchronously
         if reopen_main:
             inp, out, out_channels = self.io
             # write the same signal to both channels: some apps only listen to one

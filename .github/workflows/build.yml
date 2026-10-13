@@ -194,7 +194,7 @@ jobs:
           # it into the mic's own device, and the mic must hear it back (proves the
           # headphone stream runs). Same device for both = the AirPods case.
           results = []
-          for trial in range(6):
+          for trial in range(10):
               eng = a.Engine(sd, sr, block, eff)
               heard, pos = [], [0]
               def fake_effect(x, heard=heard, pos=pos):
