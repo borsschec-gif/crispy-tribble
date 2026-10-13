@@ -1177,6 +1177,165 @@ def play_toggle_sound(on):
     threading.Thread(target=run, daemon=True).start()
 
 
+# ---------------------------------------------------------------- updates
+# Every CI build gets a number (build_info.py, written by the workflow) and the
+# release carries version.json: {"build": N, "assets": {file name: sha256}}.
+# The app compares numbers, downloads its own file, checks the sha256 and swaps
+# itself in place. Builds from source (no build_info) never update.
+
+try:
+    from build_info import BUILD, COMMIT
+except ImportError:
+    BUILD, COMMIT = 0, "dev"
+
+RELEASES_PAGE = "https://github.com/borsschec-gif/crispy-tribble/releases/latest"
+UPDATE_URL = os.environ.get("AUTOTUNE_UPDATE_URL", RELEASES_PAGE + "/download/version.json")
+
+
+def update_asset_name():
+    if sys.platform == "win32":
+        return "autotune.exe"
+    if sys.platform == "darwin":
+        import platform
+        arch = "AppleSilicon" if platform.machine() == "arm64" else "Intel"
+        return f"Autotune-macOS-{arch}.dmg"
+    return None
+
+
+def updates_supported():
+    return (getattr(sys, "frozen", False) and BUILD > 0) or "AUTOTUNE_UPDATE_URL" in os.environ
+
+
+def check_update(timeout=10):
+    """Return {"build", "url", "sha256"} when a newer build exists, else None."""
+    import urllib.parse
+    import urllib.request
+
+    name = update_asset_name()
+    if name is None:
+        return None
+    req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "autotune-updater"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        info = json.loads(r.read().decode("utf-8"))
+    build = int(info.get("build", 0))
+    sha = info.get("assets", {}).get(name)
+    if build <= BUILD or not sha:
+        return None
+    return {"build": build, "sha256": sha, "url": urllib.parse.urljoin(UPDATE_URL, name)}
+
+
+def download_update(update, progress=None):
+    """Download to a temp file and verify its sha256; returns the path."""
+    import hashlib
+    import tempfile
+    import urllib.request
+
+    req = urllib.request.Request(update["url"], headers={"User-Agent": "autotune-updater"})
+    fd, path = tempfile.mkstemp(suffix="-" + os.path.basename(update["url"]))
+    digest = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, os.fdopen(fd, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                digest.update(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(done / total)
+        if digest.hexdigest() != update["sha256"].lower():
+            raise ValueError("файл обновления повреждён (не сошлась контрольная сумма)")
+        return path
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+
+
+def cleanup_old_update():
+    """Windows: remove the previous exe left by the last update."""
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        old = os.path.splitext(sys.executable)[0] + ".old.exe"
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def apply_update(path, relaunch=True):
+    """Put the downloaded build in place of the running one. The caller then exits."""
+    import subprocess
+
+    if sys.platform == "win32":
+        exe = sys.executable
+        old = os.path.splitext(exe)[0] + ".old.exe"
+        if os.path.exists(old):
+            os.remove(old)
+        os.replace(exe, old)  # Windows lets a running exe be renamed, not overwritten
+        try:
+            import shutil
+            shutil.move(path, exe)
+        except Exception:
+            os.replace(old, exe)
+            raise
+        if relaunch:
+            subprocess.Popen([exe], close_fds=True)
+        return
+
+    if sys.platform == "darwin":
+        import shlex
+        import tempfile
+        app = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
+        if not app.endswith(".app"):
+            raise RuntimeError("программа запущена не из Autotune.app")
+        if "/AppTranslocation/" in app:
+            raise RuntimeError("перетащи Autotune в папку «Программы» и запусти оттуда")
+        parent = os.path.dirname(app)
+        if not os.access(parent, os.W_OK):
+            raise PermissionError(f"нет прав на запись в {parent}")
+        mnt = tempfile.mkdtemp(prefix="autotune-dmg-")
+        subprocess.run(["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mnt, path],
+                       check=True, capture_output=True)
+        staging = os.path.join(parent, ".Autotune-update.app")
+        try:
+            subprocess.run(["rm", "-rf", staging], check=True)
+            subprocess.run(["ditto", os.path.join(mnt, "Autotune.app"), staging],
+                           check=True, capture_output=True)
+        finally:
+            subprocess.run(["hdiutil", "detach", mnt], capture_output=True)
+        # swap the bundles once this process has exited
+        q = shlex.quote
+        script = (f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
+                  f"rm -rf {q(app)} && mv {q(staging)} {q(app)}"
+                  + (f" && open {q(app)}" if relaunch else ""))
+        subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+
+    raise RuntimeError("автообновление работает только в Windows и macOS")
+
+
+def update_now(relaunch):
+    """--update-now: check, download, install. Exit code 0 updated, 3 up to date, 1 error."""
+    try:
+        update = check_update()
+        if update is None:
+            print("Обновлений нет.")
+            return 3
+        print(f"Скачиваю сборку {update['build']}...")
+        apply_update(download_update(update), relaunch=relaunch)
+        print("Обновлено.")
+        return 0
+    except Exception as e:
+        print(f"Ошибка обновления: {e}")
+        return 1
+
+
 def asset_path(name):
     base = getattr(sys, "_MEIPASS", app_dir())
     return os.path.join(base, "assets", name)
@@ -1290,6 +1449,11 @@ def run_gui(args):
     ctk.CTkFrame(top, width=1, height=24, fg_color=C_SELECTED).pack(side="left", padx=12)
     ctk.CTkLabel(top, text="Все изменения применяются сразу, прямо во время звонка",
                  font=font(12), text_color=C_FAINT).pack(side="left")
+    update_btn = ctk.CTkButton(top, text="", height=30, corner_radius=4, font=font(12, "bold"),
+                               fg_color=C_BLURPLE, hover_color=C_BLURPLE_HOVER,
+                               text_color="white")
+    ctk.CTkLabel(top, text=f"сборка {BUILD}" if BUILD else "из исходников", font=font(11),
+                 text_color=C_FAINT).pack(side="right", padx=16)
     ctk.CTkFrame(main, height=1, corner_radius=0, fg_color=C_LINE).grid(row=1, column=0,
                                                                          sticky="we")
 
@@ -1645,6 +1809,65 @@ def run_gui(args):
             shown[widget] = kw
             widget.configure(**kw)
 
+    # --- updates: checked in the background, offered with a button in the header
+    import threading
+    update_state = {"found": None, "progress": None, "done": None, "error": None}
+
+    def check_in_background():
+        try:
+            update_state["found"] = check_update()
+        except Exception:
+            pass  # offline or GitHub unreachable: just no update this time
+
+    def install_update():
+        update = update_state["found"]
+        update_btn.configure(state="disabled", text="Скачиваю… 0%")
+
+        def work():
+            try:
+                path = download_update(update, progress=lambda p: update_state.update(progress=p))
+                update_state["done"] = path
+            except Exception as e:
+                update_state["error"] = e
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def poll_update():
+        if update_state["found"] and not update_btn.winfo_ismapped():
+            update_btn.configure(text=f"Обновить до сборки {update_state['found']['build']}",
+                                 command=install_update)
+            update_btn.pack(side="right", padx=(0, 4), pady=9)
+        if update_state["progress"] is not None and update_state["done"] is None:
+            update_btn.configure(text=f"Скачиваю… {update_state['progress'] * 100:.0f}%")
+        if update_state["error"] is not None:
+            err, update_state["error"] = update_state["error"], None
+            update_btn.configure(state="normal", text="Обновить ещё раз")
+            if messagebox.askyesno("Автотюн", f"Не получилось обновиться:\n{err}\n\n"
+                                   "Открыть страницу загрузки, чтобы скачать вручную?"):
+                import webbrowser
+                webbrowser.open(RELEASES_PAGE)
+        if update_state["done"] is not None:
+            path, update_state["done"] = update_state["done"], None
+            update_btn.configure(text="Устанавливаю…")
+            save_settings(settings)
+            try:
+                apply_update(path, relaunch=True)
+            except Exception as e:
+                update_btn.configure(state="normal", text="Обновить ещё раз")
+                if messagebox.askyesno("Автотюн", f"Не получилось обновиться:\n{e}\n\n"
+                                       "Открыть страницу загрузки, чтобы скачать вручную?"):
+                    import webbrowser
+                    webbrowser.open(RELEASES_PAGE)
+            else:
+                on_close()  # the new version starts by itself
+                return
+        root.after(300, poll_update)
+
+    if updates_supported():
+        cleanup_old_update()
+        threading.Thread(target=check_in_background, daemon=True).start()
+        root.after(300, poll_update)
+
     def refresh():
         f0 = tuner.f0
         if not engine.enabled:
@@ -1723,6 +1946,10 @@ def main():
     p.add_argument("--samplerate", type=int, default=48000)
     p.add_argument("--block", type=int, default=256, help="размер блока (задержка)")
     p.add_argument("--print-driver-install", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--update-now", action="store_true",
+                   help="проверить обновления и установить, если есть")
+    p.add_argument("--no-relaunch", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--version", action="store_true", help="показать номер сборки")
     p.add_argument("--file", nargs=2, metavar=("IN.wav", "OUT.wav"),
                    help="обработать файл вместо живого звука (для проверки)")
     args = p.parse_args()
@@ -1731,6 +1958,11 @@ def main():
         import sounddevice as sd
         print(sd.query_devices())
         return
+    if args.version:
+        print(f"сборка {BUILD} ({COMMIT[:7]})")
+        return
+    if args.update_now:
+        sys.exit(update_now(relaunch=not args.no_relaunch))
     if args.print_driver_install:
         src = bundled_mac_driver()
         if src is None:

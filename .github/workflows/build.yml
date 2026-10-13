@@ -21,6 +21,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
+      - name: Stamp the build number (used by auto-update)
+        shell: bash
+        run: printf 'BUILD = %s\nCOMMIT = "%s"\n' "${{ github.run_number }}" "${{ github.sha }}" > build_info.py
+
       - name: Build exe
         run: >
           pyinstaller --onefile --windowed --name autotune
@@ -59,6 +63,27 @@ jobs:
           cp dist/autotune.exe README.md package/
           cd package && 7z a ../autotune-windows.zip *
 
+      - name: Auto-update test (swap the exe, reject a bad file, no-op when up to date)
+        shell: bash
+        run: |
+          mkdir -p srv upd
+          cp dist/autotune.exe upd/autotune.exe
+          printf 'NEW BUILD' > srv/autotune.exe
+          (cd srv && python -m http.server 8765 >/dev/null 2>&1 &)
+          sleep 2
+          vj() { python -c "import json,hashlib,sys; json.dump({'build': int(sys.argv[1]), 'assets': {'autotune.exe': sys.argv[2]}}, open('srv/version.json','w'))" "$1" "$2"; }
+          SHA=$(python -c "import hashlib;print(hashlib.sha256(open('srv/autotune.exe','rb').read()).hexdigest())")
+          export AUTOTUNE_UPDATE_URL=http://127.0.0.1:8765/version.json
+          vj ${{ github.run_number }} $SHA
+          rc=0; ./upd/autotune.exe --update-now --no-relaunch || rc=$?; echo "same build -> $rc"; test $rc -eq 3
+          vj $(( ${{ github.run_number }} + 1 )) 0000000000000000000000000000000000000000000000000000000000000000
+          rc=0; ./upd/autotune.exe --update-now --no-relaunch || rc=$?; echo "bad file -> $rc"; test $rc -eq 1
+          cmp -s upd/autotune.exe dist/autotune.exe && echo "exe untouched after bad file"
+          vj $(( ${{ github.run_number }} + 1 )) $SHA
+          rc=0; ./upd/autotune.exe --update-now --no-relaunch || rc=$?; echo "newer build -> $rc"; test $rc -eq 0
+          test "$(cat upd/autotune.exe)" = "NEW BUILD" && echo "exe replaced"
+          cmp -s upd/autotune.old.exe dist/autotune.exe && echo "old exe kept for cleanup"
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -85,6 +110,10 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller pillow dmgbuild
+
+      - name: Stamp the build number (used by auto-update)
+        shell: bash
+        run: printf 'BUILD = %s\nCOMMIT = "%s"\n' "${{ github.run_number }}" "${{ github.sha }}" > build_info.py
 
       # Our own virtual microphone: BlackHole (GPL-3.0) built under the name "Autotune Mic"
       - name: Build "Autotune Mic" driver
@@ -235,6 +264,27 @@ jobs:
           hdiutil detach /tmp/dmg
           hdiutil imageinfo "$DMG" | grep -E "Format:|Size"
 
+      - name: Auto-update test (the app replaces its own bundle from the DMG)
+        run: |
+          DMG="Autotune-macOS-${{ matrix.arch }}.dmg"
+          mkdir -p srv /tmp/upd
+          cp "$DMG" srv/
+          ditto dist/Autotune.app /tmp/upd/Autotune.app
+          touch /tmp/upd/Autotune.app/Contents/Resources/OLD_BUILD_MARKER
+          python -c "import json,hashlib,sys; json.dump({'build': int(sys.argv[1]) + 1, 'assets': {sys.argv[2]: hashlib.sha256(open('srv/'+sys.argv[2],'rb').read()).hexdigest()}}, open('srv/version.json','w'))" ${{ github.run_number }} "$DMG"
+          (cd srv && python -m http.server 8765 >/dev/null 2>&1 &)
+          sleep 2
+          AUTOTUNE_UPDATE_URL=http://127.0.0.1:8765/version.json \
+            /tmp/upd/Autotune.app/Contents/MacOS/Autotune --update-now --no-relaunch
+          for i in $(seq 1 30); do
+            if [ -d /tmp/upd/Autotune.app ] && [ ! -e /tmp/upd/Autotune.app/Contents/Resources/OLD_BUILD_MARKER ]; then break; fi
+            sleep 1
+          done
+          test ! -e /tmp/upd/Autotune.app/Contents/Resources/OLD_BUILD_MARKER && echo "bundle replaced"
+          test ! -e /tmp/upd/.Autotune-update.app && echo "staging cleaned up"
+          codesign --verify --deep /tmp/upd/Autotune.app && echo "new bundle signature valid"
+          /tmp/upd/Autotune.app/Contents/MacOS/Autotune --version
+
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
@@ -256,7 +306,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           find artifacts -type f
-          files=$(find artifacts -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.dmg' \))
+          python3 - <<'PY'
+          import hashlib, json, os, sys
+          assets = {}
+          for root, _, names in os.walk("artifacts"):
+              for n in names:
+                  if n.endswith((".exe", ".dmg")):
+                      assets[n] = hashlib.sha256(open(os.path.join(root, n), "rb").read()).hexdigest()
+          json.dump({"build": int(os.environ["GITHUB_RUN_NUMBER"]), "commit": os.environ["GITHUB_SHA"],
+                     "assets": assets}, open("version.json", "w"), indent=2)
+          print(open("version.json").read())
+          PY
+          files="$(find artifacts -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.dmg' \)) version.json"
           gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create latest $files --repo "$GITHUB_REPOSITORY" \
             --title "Автотюн для Discord (Windows и macOS)" \
