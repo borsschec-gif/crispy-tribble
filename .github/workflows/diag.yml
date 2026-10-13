@@ -1,0 +1,63 @@
+name: Diagnose same-device streams on Apple Silicon
+
+on:
+  push:
+    branches: [diag-listen]
+
+jobs:
+  diag:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy sounddevice
+      - name: Install a loopback device (BlackHole build, as in the app)
+        run: |
+          git clone --depth 1 --branch v0.7.2 https://github.com/ExistentialAudio/BlackHole bh
+          xcodebuild -project bh/BlackHole.xcodeproj -configuration Release -target BlackHole \
+            CONFIGURATION_BUILD_DIR="$PWD/driver-build" PRODUCT_BUNDLE_IDENTIFIER=com.autotune.mic \
+            CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" \
+            GCC_PREPROCESSOR_DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS kDriver_Name=\"Autotune\" kHas_Driver_Name_Format=false kDevice_Name=\"Autotune\ Mic\" kPlugIn_BundleID=\"com.autotune.mic\" kManufacturer_Name=\"Autotune\"' | tail -1
+          sudo cp -R driver-build/BlackHole.driver /Library/Audio/Plug-Ins/HAL/AutotuneMic.driver
+          sudo killall -9 coreaudiod; sleep 8
+      - name: Try orders and delays
+        run: |
+          python - <<'PY'
+          import threading, time, numpy as np, sounddevice as sd, autotune as a
+          sr, block = 48000, 256
+          dev = [i for i, d in enumerate(sd.query_devices()) if "Autotune Mic" in d["name"]][0]
+
+          def run(order, delay, in_ch, latency):
+              listen = None; chunks = []; stop = [False]
+              def feed():
+                  n, start = 0, time.perf_counter()
+                  while not stop[0]:
+                      due = int((time.perf_counter() - start) * sr / block) + 1
+                      while n < due:
+                          t = (np.arange(block) + n * block) / sr
+                          if listen: listen.push((0.4 * np.sin(2 * np.pi * 330 * t)).astype(np.float32))
+                          n += 1
+                      time.sleep(0.001)
+              inp = sd.InputStream(device=dev, samplerate=sr, channels=in_ch, dtype="float32",
+                                   blocksize=block, latency=latency,
+                                   callback=lambda x, f, t, st: chunks.append(x[:, 0].copy()))
+              if order == "in_first":
+                  inp.start(); time.sleep(delay); listen = a.Listen(sd, sr, block, dev, 2)
+              else:
+                  listen = a.Listen(sd, sr, block, dev, 2); time.sleep(delay); inp.start()
+              th = threading.Thread(target=feed, daemon=True); th.start()
+              time.sleep(1.0); stop[0] = True
+              inp.stop(); inp.close(); listen.close()
+              rec = np.concatenate(chunks) if chunks else np.zeros(1)
+              seg = rec[len(rec) // 3:]
+              return float(np.sqrt((seg ** 2).mean()))
+
+          for order in ("in_first", "out_first"):
+              for delay in (0.0, 0.5):
+                  for in_ch in (1, 2):
+                      res = [run(order, delay, in_ch, "low") for _ in range(4)]
+                      ok = sum(r > 0.1 for r in res)
+                      print(f"{order:9s} delay={delay} in_ch={in_ch}: {ok}/4 ok  {[round(r,3) for r in res]}", flush=True)
+          PY
