@@ -144,8 +144,10 @@ class TalkBox:
     on and off does not click.
     """
 
-    def __init__(self, sr, n_fft=1024, hop=256, lifter=40):
+    def __init__(self, sr, n_fft=1024, hop=256, lifter=40, glide=0.08, tone=0.5):
         self.sr = sr
+        self.glide = glide  # seconds for the synth to slide to a new note (portamento)
+        self.tone = tone  # 0 = dark, muffled tube .. 1 = bright
         self.n = n_fft
         self.hop = hop
         self.lifter = lifter
@@ -157,18 +159,51 @@ class TalkBox:
         self.in_v = np.zeros(0)
         self.in_c = np.zeros(0)
         self.out = np.zeros(hop)  # pre-roll so every call can return len(x) samples
-        self.phase = 0.0
+        self.phases = np.zeros(3)  # three oscillators of the "analog" synth (cycles)
+        self.freq = 0.0  # current synth pitch (glides towards the sung note)
         self.amount = 0.0  # last applied amount, ramped to avoid clicks
         self.rng = np.random.default_rng(0)
 
     def _carrier(self, n, freq):
-        if freq <= 0:
-            return self.rng.standard_normal(n) * 0.3  # unvoiced: noise keeps consonants
-        inc = 2 * np.pi * freq / self.sr
-        ph = self.phase + inc * np.arange(1, n + 1)
-        self.phase = ph[-1] % (2 * np.pi)
-        k = np.arange(1, min(60, int(self.sr * 0.45 / freq)) + 1)[:, None]
-        return (np.sin(k * ph) / k).sum(axis=0) * 0.6  # band-limited sawtooth
+        """A warm talk-box synth: two slightly detuned saws and a square, gliding
+        between notes. In pauses it holds the last note, like a held key, so
+        consonants are not hissy; only before the first note is there quiet noise."""
+        noise = self.rng.standard_normal(n) * 0.05
+        if freq <= 0 and self.freq <= 0:
+            return noise * 4
+        target = freq if freq > 0 else self.freq
+        start = self.freq if self.freq > 0 else target
+        if self.glide > 0:
+            tau = self.glide / 2.3  # "glide" = time to get ~90% of the way to the note
+            end = np.exp(np.log(start) + (np.log(target) - np.log(start))
+                         * (1 - np.exp(-n / (self.sr * tau))))
+        else:
+            end = target
+        f = np.exp(np.linspace(np.log(start), np.log(end), n + 1)[1:])
+        self.freq = float(end)
+        out = noise
+        for i, (detune, kind, level) in enumerate(((0.9965, "saw", 0.45),
+                                                   (1.0035, "saw", 0.45),
+                                                   (1.0, "square", 0.3))):
+            dt = f * detune / self.sr  # phase step in cycles per sample
+            t = (self.phases[i] + np.cumsum(dt)) % 1.0
+            self.phases[i] = t[-1]
+            wave = self._saw(t, dt)
+            if kind == "square":
+                wave = wave - self._saw((t + 0.5) % 1.0, dt)
+            out = out + level * wave
+        return out * 0.6
+
+    @staticmethod
+    def _saw(t, dt):
+        """Sawtooth with polyBLEP smoothing at the jump: no digital aliasing, cheap."""
+        y = 2 * t - 1
+        lo, hi = t < dt, t > 1 - dt
+        x = t[lo] / dt[lo]
+        y[lo] -= x + x - x * x - 1
+        x = (t[hi] - 1) / dt[hi]
+        y[hi] -= x * x + x + x + 1
+        return y
 
     def _envelope(self, mag):
         cep = np.fft.irfft(np.log(mag + 1e-9))
@@ -189,6 +224,10 @@ class TalkBox:
                 env_v = self._envelope(np.abs(V))
                 env_c = self._envelope(np.abs(C))
                 Y = C * (env_v / env_c)
+                # the tube in the mouth rounds off the highs; "tone" sets how much
+                fc = 1800.0 * 5.0 ** self.tone
+                freqs = np.fft.rfftfreq(self.n, 1 / self.sr)
+                Y /= np.sqrt(1 + (freqs / fc) ** 4)
                 # match the loudness of the voice in this frame
                 Y *= np.sqrt(np.sum(np.abs(V) ** 2) / (np.sum(np.abs(Y) ** 2) + 1e-12))
                 self.ola += np.fft.irfft(Y, self.n) * self.win
@@ -206,7 +245,7 @@ class TalkBox:
 
 class AutoTune:
     def __init__(self, sr, key=0, scale="major", speed=0.8, gate_db=-45.0, mix=1.0,
-                 transpose=0.0, talkbox=0.0):
+                 transpose=0.0, talkbox=0.0, talkbox_glide=0.08, talkbox_tone=0.5):
         self.sr = sr
         self.detector = PitchDetector(sr)
         self.shifter = PitchShifter(sr)
@@ -217,7 +256,7 @@ class AutoTune:
         self.mix = mix
         self.transpose = transpose
         self.talkbox = talkbox
-        self.tb = TalkBox(sr)
+        self.tb = TalkBox(sr, glide=talkbox_glide, tone=talkbox_tone)
         self.correction = 0.0  # current correction in semitones
         self.f0 = 0.0
 
@@ -295,7 +334,8 @@ def process_file(args):
     eff = effective_settings(args, load_settings())
     tuner = AutoTune(sr, key=parse_key(eff["key"]), scale=eff["scale"], speed=eff["speed"],
                      gate_db=eff["gate"], mix=eff["mix"], transpose=eff["transpose"],
-                     talkbox=eff["talkbox"])
+                     talkbox=eff["talkbox"], talkbox_glide=eff["talkbox_glide"],
+                     talkbox_tone=eff["talkbox_tone"])
     out = np.concatenate([tuner.process(x[i:i + args.block])
                           for i in range(0, len(x), args.block)]) * eff["gain"]
     write_wav(args.file[1], out, sr)
@@ -487,7 +527,8 @@ def install_mac_driver(sd, say=print):
 
 
 DEFAULTS = {"key": "C", "scale": "chromatic", "speed": 0.9, "transpose": 0.0,
-            "mix": 1.0, "talkbox": 0.0, "gain": 1.0, "gate": -45.0,
+            "mix": 1.0, "talkbox": 0.0, "talkbox_glide": 0.08,
+            "talkbox_tone": 0.5, "gain": 1.0, "gate": -45.0,
             "enabled": True, "hotkey": HOTKEY_DEFAULT,
             "listen": False, "listen_volume": 0.8}
 
@@ -576,7 +617,9 @@ class Engine:
         self.block = block
         self.tuner = AutoTune(sr, key=parse_key(eff["key"]), scale=eff["scale"],
                               speed=eff["speed"], gate_db=eff["gate"], mix=eff["mix"],
-                              transpose=eff["transpose"], talkbox=eff["talkbox"])
+                              transpose=eff["transpose"], talkbox=eff["talkbox"],
+                              talkbox_glide=eff["talkbox_glide"],
+                              talkbox_tone=eff["talkbox_tone"])
         self.gain = eff["gain"]
         self.enabled = eff["enabled"]
         self.listen_volume = eff["listen_volume"]
@@ -875,13 +918,16 @@ SCALE_LABELS = {
 PRESETS = {
     "Естественно": {"speed": 0.5, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
     "T-Pain": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
-    # Ye "All the Love" (Bully): hard-tuned vocal blended with a talk box
-    "Бабияй": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.65},
-    "Чистый ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0},
+    # Ye "All the Love" (Bully), the opening line: André Troutman's talk box —
+    # a pure, warm synth voice gliding between tuned notes
+    "Бабияй": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0,
+               "talkbox_glide": 0.1, "talkbox_tone": 0.4},
+    "Чистый ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0,
+                        "talkbox_glide": 0.03, "talkbox_tone": 0.65},
     "Бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0},
     "Демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0},
     "Сброс": {"speed": 0.9, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0, "gain": 1.0,
-              "gate": -45.0},
+              "gate": -45.0, "talkbox_glide": 0.08, "talkbox_tone": 0.5},
 }
 
 # Discord dark theme
@@ -1517,6 +1563,8 @@ def run_gui(args):
     def set_transpose(v): tuner.transpose = v
     def set_mix(v): tuner.mix = v
     def set_talkbox(v): tuner.talkbox = v
+    def set_glide(v): tuner.tb.glide = v
+    def set_tone(v): tuner.tb.tone = v
     def set_gain(v): engine.gain = v
     def set_gate(v): tuner.gate_db = v
 
@@ -1529,6 +1577,11 @@ def run_gui(args):
          lambda v: v * 100, lambda u: u / 100, pct, set_speed),
         ("talkbox", "Ток-бокс", "синтезатор, который «поёт» твоими гласными", 0, 100, 100,
          lambda v: v * 100, lambda u: u / 100, pct, set_talkbox),
+        ("talkbox_glide", "Глайд ток-бокса", "за сколько голос доезжает до новой ноты",
+         0, 200, 200, lambda v: v * 1000, lambda u: u / 1000,
+         lambda v: f"{v * 1000:.0f} мс", set_glide),
+        ("talkbox_tone", "Яркость ток-бокса", "0% — глухо, как через трубку; 100% — ярко",
+         0, 100, 100, lambda v: v * 100, lambda u: u / 100, pct, set_tone),
         ("transpose", "Сдвиг высоты", "в полутонах, 12 = октава", -12, 12, 24,
          lambda v: v, lambda u: float(round(u)), lambda v: f"{v:+.0f}", set_transpose),
         ("mix", "Сила эффекта", "смесь с чистым голосом", 0, 100, 100,
@@ -1658,6 +1711,10 @@ def main():
     p.add_argument("--mix", type=float, help="0..1, доля обработанного звука")
     p.add_argument("--talkbox", type=float,
                    help="0..1, эффект ток-бокса (синтезатор, который «говорит» твоим голосом)")
+    p.add_argument("--talkbox-glide", dest="talkbox_glide", type=float,
+                   help="ток-бокс: за сколько секунд голос доезжает до новой ноты (0.08)")
+    p.add_argument("--talkbox-tone", dest="talkbox_tone", type=float,
+                   help="ток-бокс: яркость 0..1 (0 — глухо, 1 — ярко)")
     p.add_argument("--gain", type=float, help="громкость на выходе")
     p.add_argument("--gate", type=float,
                    help="порог тишины в дБ (ниже — без обработки)")
