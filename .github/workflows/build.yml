@@ -24,9 +24,22 @@ jobs:
       - name: Build exe
         run: >
           pyinstaller --onefile --windowed --name autotune
+          --icon assets/icon.ico --add-data "assets;assets"
           --collect-all _sounddevice_data
           --collect-all customtkinter
           autotune.py
+
+      - name: Hotkey test (press Ctrl+Alt+A while the shortcut is registered)
+        continue-on-error: true
+        run: |
+          python -c "
+          import ctypes, time, autotune as a
+          hk = a.GlobalHotkey({'Ctrl', 'Alt'}, 'A'); print('registered:', hk.start(), hk.error)
+          u = ctypes.windll.user32
+          for vk in (0x11, 0x12, 0x41): u.keybd_event(vk, 0, 0, 0)
+          for vk in (0x41, 0x12, 0x11): u.keybd_event(vk, 0, 2, 0)
+          time.sleep(1); print('presses:', hk.presses); hk.stop()
+          assert hk.presses == 1"
 
       - name: Smoke test
         shell: bash
@@ -71,7 +84,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller
+        run: pip install -r requirements.txt pyinstaller pillow
 
       # Our own virtual microphone: BlackHole (GPL-3.0) built under the name "Autotune Mic"
       - name: Build "Autotune Mic" driver
@@ -91,6 +104,7 @@ jobs:
       - name: Build app
         run: |
           pyinstaller --windowed --name Autotune --osx-bundle-identifier com.autotune.app \
+            --icon assets/icon.png --add-data "assets:assets" \
             --collect-all _sounddevice_data --collect-all customtkinter autotune.py
           APP=dist/Autotune.app
           cp -R AutotuneMic.driver "$APP/Contents/Resources/"
@@ -100,6 +114,32 @@ jobs:
             "$APP/Contents/Info.plist"
           codesign --force --deep -s - "$APP"
           codesign --verify --deep --verbose "$APP"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$APP/Contents/Info.plist"
+          ls "$APP/Contents/Resources/"*.icns
+
+      - name: Hotkey test (post Ctrl+Option+A while the shortcut is registered)
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import ctypes, autotune as a, tkinter as tk
+          root = tk.Tk(); root.update()
+          hk = a.GlobalHotkey({"Ctrl", "Alt"}, "A"); print("registered:", hk.start(), hk.error)
+          q = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+          q.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+          q.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+          q.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+          q.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+          def press():
+              for down in (True, False):
+                  ev = q.CGEventCreateKeyboardEvent(None, 0x00, down)  # A
+                  q.CGEventSetFlags(ev, 0x40000 | 0x80000)  # control | option
+                  q.CGEventPost(0, ev)
+          root.after(300, press)
+          root.after(2000, root.quit)
+          root.mainloop()
+          print("presses:", hk.presses); hk.stop()
+          assert hk.presses == 1
+          PY
 
       - name: Smoke test (audio processing)
         run: |

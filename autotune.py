@@ -14,6 +14,7 @@ import wave
 import numpy as np
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+HOTKEY_DEFAULT = "Ctrl+Alt+A"  # toggles autotune; changeable in the window
 FLAT_ALIASES = {"DB": "C#", "EB": "D#", "GB": "F#", "AB": "G#", "BB": "A#"}
 SCALES = {
     "chromatic": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
@@ -487,7 +488,7 @@ def install_mac_driver(sd, say=print):
 
 DEFAULTS = {"key": "C", "scale": "chromatic", "speed": 0.9, "transpose": 0.0,
             "mix": 1.0, "talkbox": 0.0, "gain": 1.0, "gate": -45.0,
-            "enabled": True}
+            "enabled": True, "hotkey": HOTKEY_DEFAULT}
 
 
 def effective_settings(args, settings):
@@ -707,6 +708,254 @@ C_GREEN = "#23a55a"
 C_RED = "#f23f43"
 
 
+# ---------------------------------------------------------------- hotkeys
+# A system-wide shortcut that toggles autotune while Discord (or a game) is
+# focused. Windows: RegisterHotKey; macOS: Carbon RegisterEventHotKey. Neither
+# needs extra permissions. Elsewhere the shortcut works only in our window.
+
+HOTKEY_MODS = ["Ctrl", "Alt", "Shift", "Cmd"]
+FKEYS = [f"F{i}" for i in range(1, 13)]
+
+# macOS virtual key codes (HIToolbox/Events.h)
+MAC_KEYCODES = {
+    "A": 0x00, "S": 0x01, "D": 0x02, "F": 0x03, "H": 0x04, "G": 0x05, "Z": 0x06, "X": 0x07,
+    "C": 0x08, "V": 0x09, "B": 0x0B, "Q": 0x0C, "W": 0x0D, "E": 0x0E, "R": 0x0F, "Y": 0x10,
+    "T": 0x11, "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15, "6": 0x16, "5": 0x17, "9": 0x19,
+    "7": 0x1A, "8": 0x1C, "0": 0x1D, "O": 0x1F, "U": 0x20, "I": 0x22, "P": 0x23, "L": 0x25,
+    "J": 0x26, "K": 0x28, "N": 0x2D, "M": 0x2E,
+    "F1": 0x7A, "F2": 0x78, "F3": 0x63, "F4": 0x76, "F5": 0x60, "F6": 0x61, "F7": 0x62,
+    "F8": 0x64, "F9": 0x65, "F10": 0x6D, "F11": 0x67, "F12": 0x6F,
+}
+
+
+def parse_hotkey(text):
+    """'Ctrl+Alt+A' -> ({'Ctrl', 'Alt'}, 'A'); None if invalid."""
+    parts = [p.strip() for p in (text or "").split("+") if p.strip()]
+    if not parts:
+        return None
+    aliases = {"control": "Ctrl", "ctrl": "Ctrl", "alt": "Alt", "option": "Alt",
+               "shift": "Shift", "cmd": "Cmd", "command": "Cmd", "win": "Cmd"}
+    mods = set()
+    for p in parts[:-1]:
+        m = aliases.get(p.lower())
+        if m is None:
+            return None
+        mods.add(m)
+    key = parts[-1].upper()
+    if not (key in FKEYS or (len(key) == 1 and key.isalnum() and key.isascii())):
+        return None
+    if not mods and key not in FKEYS:
+        return None  # a bare letter would fire while typing in chat
+    return mods, key
+
+
+def hotkey_text(mods, key, platform=None):
+    """Display form, with the platform's names for the keys."""
+    platform = platform or sys.platform
+    names = {"Alt": "Option" if platform == "darwin" else "Alt",
+             "Cmd": "Cmd" if platform == "darwin" else "Win"}
+    return "+".join([names.get(m, m) for m in HOTKEY_MODS if m in mods] + [key])
+
+
+def canonical_hotkey(mods, key):
+    return "+".join([m for m in HOTKEY_MODS if m in mods] + [key])
+
+
+class GlobalHotkey:
+    """Counts presses of a system-wide shortcut; the GUI polls `presses`."""
+
+    def __init__(self, mods, key):
+        self.mods, self.key = mods, key
+        self.presses = 0
+        self.error = None
+        self._stop = None
+
+    def start(self):
+        try:
+            if sys.platform == "win32":
+                self._start_windows()
+            elif sys.platform == "darwin":
+                self._start_mac()
+            else:
+                self.error = "только когда окно программы активно"
+        except Exception as e:  # never let a shortcut problem break the app
+            self.error = f"не удалось включить ({e})"
+        return self.error is None
+
+    def stop(self):
+        if self._stop:
+            self._stop()
+            self._stop = None
+
+    def _start_windows(self):
+        import ctypes
+        import threading
+        from ctypes import wintypes
+
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT,
+                                          wintypes.UINT]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                       wintypes.UINT, wintypes.UINT]
+        user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM,
+                                              wintypes.LPARAM]
+        flags = {"Alt": 0x1, "Ctrl": 0x2, "Shift": 0x4, "Cmd": 0x8}
+        mod = sum(flags[m] for m in self.mods) | 0x4000  # MOD_NOREPEAT
+        vk = 0x70 + FKEYS.index(self.key) if self.key in FKEYS else ord(self.key)
+        ready = threading.Event()
+        state = {}
+
+        def loop():
+            state["tid"] = kernel32.GetCurrentThreadId()
+            if not user32.RegisterHotKey(None, 1, mod, vk):
+                self.error = "это сочетание уже занято другой программой"
+                ready.set()
+                return
+            ready.set()
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    self.presses += 1
+            user32.UnregisterHotKey(None, 1)
+
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+        ready.wait(2)
+
+        def stop():
+            if "tid" in state:
+                user32.PostThreadMessageW(state["tid"], 0x0012, 0, 0)  # WM_QUIT
+            t.join(1)
+
+        self._stop = stop
+
+    def _start_mac(self):
+        import ctypes
+        from ctypes import c_uint32, c_void_p, POINTER, byref
+
+        carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
+
+        class EventTypeSpec(ctypes.Structure):
+            _fields_ = [("eventClass", c_uint32), ("eventKind", c_uint32)]
+
+        class EventHotKeyID(ctypes.Structure):
+            _fields_ = [("signature", c_uint32), ("id", c_uint32)]
+
+        handler_t = ctypes.CFUNCTYPE(ctypes.c_int32, c_void_p, c_void_p, c_void_p)
+        carbon.GetApplicationEventTarget.restype = c_void_p
+        carbon.InstallEventHandler.argtypes = [c_void_p, handler_t, c_uint32,
+                                               POINTER(EventTypeSpec), c_void_p,
+                                               POINTER(c_void_p)]
+        carbon.RegisterEventHotKey.argtypes = [c_uint32, c_uint32, EventHotKeyID, c_void_p,
+                                               c_uint32, POINTER(c_void_p)]
+        carbon.UnregisterEventHotKey.argtypes = [c_void_p]
+        carbon.RemoveEventHandler.argtypes = [c_void_p]
+
+        def on_hotkey(_call, _event, _data):
+            self.presses += 1
+            return 0
+
+        self._handler = handler_t(on_hotkey)  # keep a reference: called from C
+        target = carbon.GetApplicationEventTarget()
+        spec = EventTypeSpec(int.from_bytes(b"keyb", "big"), 5)  # kEventHotKeyPressed
+        handler_ref = c_void_p()
+        status = carbon.InstallEventHandler(target, self._handler, 1, byref(spec), None,
+                                            byref(handler_ref))
+        if status != 0:
+            raise OSError(f"InstallEventHandler {status}")
+        flags = {"Cmd": 0x100, "Shift": 0x200, "Alt": 0x800, "Ctrl": 0x1000}
+        mod = sum(flags[m] for m in self.mods)
+        hk_ref = c_void_p()
+        status = carbon.RegisterEventHotKey(MAC_KEYCODES[self.key], mod,
+                                            EventHotKeyID(int.from_bytes(b"AuTu", "big"), 1),
+                                            target, 0, byref(hk_ref))
+        if status != 0:
+            carbon.RemoveEventHandler(handler_ref)
+            self.error = "это сочетание уже занято системой или другой программой"
+            return
+
+        def stop():
+            carbon.UnregisterEventHotKey(hk_ref)
+            carbon.RemoveEventHandler(handler_ref)
+
+        self._stop = stop
+
+
+def hotkey_from_tk_event(event, platform=None):
+    """Read a shortcut from a Tk <KeyPress>; None for a lone modifier or unknown key."""
+    platform = platform or sys.platform
+    state = event.state
+    mods = set()
+    if state & 0x4:
+        mods.add("Ctrl")
+    if state & 0x1:
+        mods.add("Shift")
+    if platform == "win32":
+        if state & 0x20000:
+            mods.add("Alt")
+    elif platform == "darwin":
+        if state & 0x10:
+            mods.add("Alt")
+        if state & 0x8:
+            mods.add("Cmd")
+    else:
+        if state & 0x8:
+            mods.add("Alt")
+        if state & 0x40:
+            mods.add("Cmd")
+    sym = event.keysym
+    key = None
+    if sym.upper() in FKEYS:
+        key = sym.upper()
+    elif len(sym) == 1 and sym.isalnum() and sym.isascii():
+        key = sym.upper()
+    elif platform == "darwin":
+        # Option+letter types a special character; recover the physical key
+        # (Tk on macOS keeps the virtual key code in the top byte)
+        vk = (event.keycode >> 24) & 0xFF
+        key = next((k for k, v in MAC_KEYCODES.items() if v == vk), None)
+    if key is None:
+        return None
+    return mods, key
+
+
+def play_toggle_sound(on):
+    """Short cue in the user's own speakers (Discord does not hear it)."""
+    import threading
+
+    def run():
+        try:
+            if sys.platform == "win32":
+                import winsound
+                winsound.Beep(880 if on else 440, 90)
+            elif sys.platform == "darwin":
+                import subprocess
+                name = "Pop" if on else "Bottle"
+                subprocess.run(["afplay", f"/System/Library/Sounds/{name}.aiff"],
+                               capture_output=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def asset_path(name):
+    base = getattr(sys, "_MEIPASS", app_dir())
+    return os.path.join(base, "assets", name)
+
+
+def set_window_icon(root):
+    try:
+        if sys.platform == "win32":
+            root.iconbitmap(asset_path("icon.ico"))
+        else:
+            import tkinter as tk
+            root._icon = tk.PhotoImage(file=asset_path("icon.png"))
+            root.iconphoto(True, root._icon)
+    except Exception:
+        pass  # running without the assets folder: keep the default icon
+
+
 def run_gui(args):
     """Discord-styled settings window; every change applies immediately."""
     from tkinter import messagebox
@@ -717,6 +966,7 @@ def run_gui(args):
     ctk.set_appearance_mode("dark")
     root = ctk.CTk(fg_color=C_MAIN)
     root.title("Автотюн для Discord")
+    set_window_icon(root)
     root.geometry("780x780")
     root.minsize(700, 520)
 
@@ -846,6 +1096,71 @@ def run_gui(args):
         schedule_save()
 
     switch.configure(command=lambda: set_enabled(enabled_var.get()))
+
+    # --- keyboard shortcut (works while Discord is focused)
+    hk_row = ctk.CTkFrame(live, fg_color="transparent")
+    hk_row.grid(row=2, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 14))
+    ctk.CTkLabel(hk_row, text="Вкл/выкл с клавиатуры", font=font(12),
+                 text_color=C_FAINT).pack(side="left")
+    hk_btn = ctk.CTkButton(hk_row, text="", height=28, width=130, corner_radius=4,
+                           fg_color=C_INPUT, hover_color=C_HOVER, text_color=C_TEXT,
+                           font=font(12, "bold"))
+    hk_btn.pack(side="left", padx=10)
+    hk_status = ctk.CTkLabel(hk_row, text="", font=font(12), text_color=C_FAINT)
+    hk_status.pack(side="left")
+    hotkey = {"obj": None, "parsed": None, "seen": 0, "capturing": False}
+
+    def apply_hotkey(text):
+        if hotkey["obj"] is not None:
+            hotkey["obj"].stop()
+        parsed = parse_hotkey(text) or parse_hotkey(HOTKEY_DEFAULT)
+        hk = GlobalHotkey(*parsed)
+        ok = hk.start()
+        hotkey.update(obj=hk, parsed=parsed, seen=0)
+        hk_btn.configure(text=hotkey_text(*parsed))
+        if ok:
+            hk_status.configure(text="работает везде, даже когда открыт Discord",
+                                text_color=C_FAINT)
+        else:
+            hk_status.configure(text=hk.error,
+                                text_color=C_RED if "занято" in hk.error else C_FAINT)
+        settings["hotkey"] = canonical_hotkey(*parsed)
+        schedule_save()
+
+    def toggle_by_hotkey():
+        set_enabled(not engine.enabled)
+        play_toggle_sound(engine.enabled)
+
+    def start_capture():
+        if hotkey["obj"] is not None:
+            hotkey["obj"].stop()  # so pressing the old shortcut now does not toggle
+        hotkey["capturing"] = True
+        hk_btn.configure(text="Нажми сочетание…")
+        hk_status.configure(text="например Ctrl+Alt+A или F9  ·  Esc — отмена",
+                            text_color=C_FAINT)
+
+    def on_key(event):
+        pressed = hotkey_from_tk_event(event)
+        if hotkey["capturing"]:
+            if event.keysym == "Escape":
+                hotkey["capturing"] = False
+                apply_hotkey(settings.get("hotkey", HOTKEY_DEFAULT))
+            elif pressed is not None:
+                mods, key = pressed
+                if not mods and key not in FKEYS:
+                    hk_status.configure(text="добавь Ctrl, Alt или Shift", text_color=C_RED)
+                else:
+                    hotkey["capturing"] = False
+                    apply_hotkey(canonical_hotkey(mods, key))
+            return "break"
+        hk = hotkey["obj"]
+        if hk is not None and hk.error and pressed == hotkey["parsed"]:
+            toggle_by_hotkey()  # no system-wide shortcut: at least work in our window
+            return "break"
+        return None
+
+    hk_btn.configure(command=start_capture)
+    root.bind_all("<KeyPress>", on_key)
 
     # --- presets
     pre = card("ПРЕСЕТЫ", 1)
@@ -1021,14 +1336,23 @@ def run_gui(args):
             show(note_lbl, text="—", text_color=C_FAINT)
             show(info_lbl, text="Спой что-нибудь")
         meter.set(min(1.0, engine.level))
+        hk = hotkey["obj"]
+        if hk is not None and hk.presses != hotkey["seen"]:
+            n = hk.presses - hotkey["seen"]
+            hotkey["seen"] = hk.presses
+            if n % 2:
+                toggle_by_hotkey()
         root.after(80, refresh)
 
     def on_close():
         save_settings(settings)
+        if hotkey["obj"] is not None:
+            hotkey["obj"].stop()
         engine.stop()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    apply_hotkey(eff["hotkey"])
     set_enabled(engine.enabled)
     open_mic(inp)
     refresh()
