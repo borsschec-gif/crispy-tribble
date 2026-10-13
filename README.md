@@ -15,8 +15,8 @@
 | Система | Файл | Виртуальный микрофон |
 |---|---|---|
 | Windows | `autotune.exe` | бесплатный VB-Audio Virtual Cable (программа предложит установить) |
-| Mac на M1–M4 | `Autotune-macOS-AppleSilicon.zip` | **встроен** — «Autotune Mic» |
-| Mac на Intel | `Autotune-macOS-Intel.zip` | **встроен** — «Autotune Mic» |
+| Mac на M1–M4 | `Autotune-macOS-AppleSilicon.dmg` | **встроен** — «Autotune Mic» |
+| Mac на Intel | `Autotune-macOS-Intel.dmg` | **встроен** — «Autotune Mic» |
 
 ## Окно программы
 
@@ -45,7 +45,7 @@
 
 ## macOS
 
-1. Распакуй архив и перетащи **Autotune.app** в «Программы».
+1. Открой `.dmg` и перетащи **Autotune** на папку «Программы» (Applications).
 2. Первый запуск: приложение не подписано в Apple, поэтому macOS его заблокирует.
    Открой «Системные настройки» → «Конфиденциальность и безопасность» → внизу «Всё равно открыть»
    (или правый клик по приложению → «Открыть»).

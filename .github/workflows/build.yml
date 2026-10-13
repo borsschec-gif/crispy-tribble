@@ -84,7 +84,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller pillow
+        run: pip install -r requirements.txt pyinstaller pillow dmgbuild
 
       # Our own virtual microphone: BlackHole (GPL-3.0) built under the name "Autotune Mic"
       - name: Build "Autotune Mic" driver
@@ -179,13 +179,27 @@ jobs:
           assert abs(peak - 440) < 2 and seg.std() > 0.05
           PY
 
-      - name: Package
-        run: ditto -c -k --keepParent dist/Autotune.app "Autotune-macOS-${{ matrix.arch }}.zip"
+      # Classic installer: drag the app onto the Applications folder
+      - name: Build DMG
+        run: |
+          DMG="Autotune-macOS-${{ matrix.arch }}.dmg"
+          tiffutil -cathidpicheck assets/dmg_background.png assets/dmg_background@2x.png -out dmg_bg.tiff
+          ICNS=$(ls dist/Autotune.app/Contents/Resources/*.icns | head -1)
+          dmgbuild -s tools/dmg_settings.py -D app=dist/Autotune.app -D background=dmg_bg.tiff \
+            -D icon="$ICNS" "Автотюн" "$DMG"
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/dmg "$DMG"
+          ls -la /tmp/dmg /tmp/dmg/.background
+          test -L /tmp/dmg/Applications && test "$(readlink /tmp/dmg/Applications)" = /Applications
+          test -f /tmp/dmg/.DS_Store
+          codesign --verify --deep --verbose /tmp/dmg/Autotune.app
+          test -d /tmp/dmg/Autotune.app/Contents/Resources/AutotuneMic.driver
+          hdiutil detach /tmp/dmg
+          hdiutil imageinfo "$DMG" | grep -E "Format:|Size"
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: Autotune-macOS-${{ matrix.arch }}.zip
+          path: Autotune-macOS-${{ matrix.arch }}.dmg
 
   release:
     needs: [windows, macos]
@@ -202,9 +216,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           find artifacts -type f
-          files=$(find artifacts -type f \( -name '*.zip' -o -name '*.exe' \))
+          files=$(find artifacts -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.dmg' \))
           gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create latest $files --repo "$GITHUB_REPOSITORY" \
             --title "Автотюн для Discord (Windows и macOS)" \
-            --notes "Windows: autotune.exe (нужен бесплатный VB-Audio Virtual Cable, программа предложит установить). macOS: Autotune-macOS-AppleSilicon.zip (M1–M4) или Autotune-macOS-Intel.zip — со встроенным виртуальным микрофоном «Autotune Mic». Подробности в README." \
+            --notes "Windows: autotune.exe (нужен бесплатный VB-Audio Virtual Cable, программа предложит установить). macOS: Autotune-macOS-AppleSilicon.dmg (M1–M4) или Autotune-macOS-Intel.dmg — открой и перетащи в «Программы»; со встроенным виртуальным микрофоном «Autotune Mic». Подробности в README." \
             --target "$GITHUB_SHA"
