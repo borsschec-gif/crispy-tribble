@@ -520,11 +520,13 @@ class Listen:
     """
 
     MAX_BLOCKS = 4  # caps the extra headphone latency at a few blocks
+    PRIME_BLOCKS = 2  # jitter buffer: mic and headphones run on different clocks
 
     def __init__(self, sd, sr, block, device, channels):
         from collections import deque
         self.queue = deque()
         self.pending = np.zeros(0, dtype=np.float32)
+        self.primed = False
         self.volume = 1.0
         self.stream = sd.OutputStream(device=device, samplerate=sr, channels=channels,
                                       dtype="float32", latency="low", blocksize=block,
@@ -538,11 +540,14 @@ class Listen:
 
     def _callback(self, outdata, frames, time, status):
         out = np.zeros(frames, dtype=np.float32)
+        if not self.primed and len(self.queue) >= self.PRIME_BLOCKS:
+            self.primed = True
         filled = 0
-        while filled < frames:
+        while self.primed and filled < frames:
             if not len(self.pending):
                 if not self.queue:
-                    break  # underrun: the rest stays silent
+                    self.primed = False  # underrun: refill a little before playing on
+                    break
                 self.pending = self.queue.popleft()
             n = min(frames - filled, len(self.pending))
             out[filled:filled + n] = self.pending[:n]

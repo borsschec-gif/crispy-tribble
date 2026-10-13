@@ -188,13 +188,15 @@ jobs:
           listen = a.Listen(sd, sr, block, dev, 2)
           listen.volume = 0.5
           stop = False
-          def feed():
-              n = 0
+          def feed():  # like the mic callback: one block per block of real time
+              n, start = 0, time.perf_counter()
               while not stop:
-                  t = (np.arange(block) + n) / sr
-                  listen.push((0.4 * np.sin(2 * np.pi * 330 * t)).astype(np.float32))
-                  n += block
-                  time.sleep(block / sr)
+                  due = int((time.perf_counter() - start) * sr / block) + 1
+                  while n < due:
+                      t = (np.arange(block) + n * block) / sr
+                      listen.push((0.4 * np.sin(2 * np.pi * 330 * t)).astype(np.float32))
+                      n += 1
+                  time.sleep(0.001)
           threading.Thread(target=feed, daemon=True).start()
           # record the way the app's own mic stream runs (same block size and latency):
           # like AirPods used as both the mic and the headphones
