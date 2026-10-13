@@ -69,7 +69,7 @@ jobs:
           mkdir -p srv upd
           cp dist/autotune.exe upd/autotune.exe
           printf 'NEW BUILD' > srv/autotune.exe
-          (cd srv && python -m http.server 8765 >/dev/null 2>&1 &)
+          (cd srv && python -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &)
           sleep 2
           vj() { python -c "import json,hashlib,sys; json.dump({'build': int(sys.argv[1]), 'assets': {'autotune.exe': sys.argv[2]}}, open('srv/version.json','w'))" "$1" "$2"; }
           SHA=$(python -c "import hashlib;print(hashlib.sha256(open('srv/autotune.exe','rb').read()).hexdigest())")
@@ -272,8 +272,9 @@ jobs:
           ditto dist/Autotune.app /tmp/upd/Autotune.app
           touch /tmp/upd/Autotune.app/Contents/Resources/OLD_BUILD_MARKER
           python -c "import json,hashlib,sys; json.dump({'build': int(sys.argv[1]) + 1, 'assets': {sys.argv[2]: hashlib.sha256(open('srv/'+sys.argv[2],'rb').read()).hexdigest()}}, open('srv/version.json','w'))" ${{ github.run_number }} "$DMG"
-          (cd srv && python -m http.server 8765 >/dev/null 2>&1 &)
-          sleep 2
+          (cd srv && python -m http.server 8765 --bind 127.0.0.1 >../srv.log 2>&1 &)
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:8765/version.json >/dev/null && break; sleep 0.5; done
+          curl -sf http://127.0.0.1:8765/version.json
           AUTOTUNE_UPDATE_URL=http://127.0.0.1:8765/version.json \
             /tmp/upd/Autotune.app/Contents/MacOS/Autotune --update-now --no-relaunch
           for i in $(seq 1 30); do
