@@ -488,7 +488,8 @@ def install_mac_driver(sd, say=print):
 
 DEFAULTS = {"key": "C", "scale": "chromatic", "speed": 0.9, "transpose": 0.0,
             "mix": 1.0, "talkbox": 0.0, "gain": 1.0, "gate": -45.0,
-            "enabled": True, "hotkey": HOTKEY_DEFAULT}
+            "enabled": True, "hotkey": HOTKEY_DEFAULT,
+            "listen": False, "listen_volume": 0.8}
 
 
 def effective_settings(args, settings):
@@ -511,6 +512,52 @@ class CableMissing(LookupError):
     pass
 
 
+class Listen:
+    """Plays the processed voice into headphones on its own stream.
+
+    The main callback only drops blocks into a short queue, so a slow or
+    unplugged headphone device can never stall what Discord hears.
+    """
+
+    MAX_BLOCKS = 4  # caps the extra headphone latency at a few blocks
+
+    def __init__(self, sd, sr, block, device, channels):
+        from collections import deque
+        self.queue = deque()
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.volume = 1.0
+        self.stream = sd.OutputStream(device=device, samplerate=sr, channels=channels,
+                                      dtype="float32", latency="low", blocksize=block,
+                                      callback=self._callback)
+        self.stream.start()
+
+    def push(self, y):
+        self.queue.append(y)
+        while len(self.queue) > self.MAX_BLOCKS:
+            self.queue.popleft()
+
+    def _callback(self, outdata, frames, time, status):
+        out = np.zeros(frames, dtype=np.float32)
+        filled = 0
+        while filled < frames:
+            if not len(self.pending):
+                if not self.queue:
+                    break  # underrun: the rest stays silent
+                self.pending = self.queue.popleft()
+            n = min(frames - filled, len(self.pending))
+            out[filled:filled + n] = self.pending[:n]
+            self.pending = self.pending[n:]
+            filled += n
+        outdata[:] = (out * self.volume)[:, None]
+
+    def close(self):
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
+
+
 class Engine:
     """Audio stream around an AutoTune whose parameters may change at any time."""
 
@@ -523,9 +570,10 @@ class Engine:
                               transpose=eff["transpose"], talkbox=eff["talkbox"])
         self.gain = eff["gain"]
         self.enabled = eff["enabled"]
+        self.listen_volume = eff["listen_volume"]
         self.level = 0.0
         self.stream = None
-        self.monitor = None
+        self.listen = None
 
     def callback(self, indata, outdata, frames, time, status):
         x = indata[:, 0]
@@ -537,35 +585,56 @@ class Engine:
         y = np.clip(y * self.gain, -1, 1).astype(np.float32)
         self.level = float(np.abs(y).max()) if len(y) else 0.0
         outdata[:] = y[:, None]  # broadcast to every output channel
-        mon = self.monitor
-        if mon is not None:
-            try:
-                mon.write(y[:, None].copy())
-            except Exception:
-                pass
+        listen = self.listen
+        if listen is not None:
+            listen.volume = self.listen_volume
+            listen.push(y.copy())
 
     def start(self, inp, out, mon=None, out_channels=1):
-        self.stop()
+        """(Re)open the mic -> virtual cable stream; headphones stay as they are."""
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
         # write the same signal to both channels: some apps only listen to one
         self.stream = self.sd.Stream(device=(inp, out), samplerate=self.sr,
                                      blocksize=self.block, channels=(1, out_channels),
                                      dtype="float32", latency="low", callback=self.callback)
         if mon is not None:
-            m = self.sd.OutputStream(device=mon, samplerate=self.sr, channels=1,
-                                     dtype="float32", latency="low", blocksize=self.block)
-            m.start()
-            self.monitor = m
+            self.set_listen(mon)
         self.stream.start()
 
+    def set_listen(self, device, channels=1):
+        """Start/stop hearing yourself in headphones (device index or None)."""
+        old, self.listen = self.listen, None
+        if old is not None:
+            old.close()
+        if device is not None:
+            self.listen = Listen(self.sd, self.sr, self.block, device, channels)
+
     def stop(self):
-        for s in (self.stream, self.monitor):
-            if s is not None:
-                try:
-                    s.stop()
-                    s.close()
-                except Exception:
-                    pass
-        self.stream = self.monitor = None
+        self.set_listen(None)
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+        self.stream = None
+
+
+# virtual cables and system aliases are not headphones
+NOT_HEADPHONES = ["CABLE Input", "Autotune Mic", "BlackHole", "autotune", "Mapper",
+                  "Переназначение", "Primary Sound", "Первичный"]
+
+
+def list_headphones(devices, hostapi):
+    return [i for i, d in enumerate(devices)
+            if d["max_output_channels"] > 0 and d["hostapi"] == hostapi
+            and not any(x.lower() in d["name"].lower() for x in NOT_HEADPHONES)]
 
 
 def default_input(sd, devices):
@@ -1213,8 +1282,87 @@ def run_gui(args):
     ctk.CTkLabel(hint, text=discord_device_name(devices[out]["name"]), font=font(13, "bold"),
                  text_color=C_TEXT).pack(side="left")
 
+    # --- hear yourself in headphones
+    lis = card("ПРОСЛУШИВАНИЕ", 3)
+    phones = list_headphones(devices, api)
+    phone_names = [devices[i]["name"] for i in phones]
+    default_out = sd.default.device[1]
+    phone_idx = None
+    if settings.get("listen_device") in phone_names:
+        phone_idx = phones[phone_names.index(settings["listen_device"])]
+    elif default_out in phones:
+        phone_idx = default_out
+    elif phones:
+        phone_idx = phones[0]
+
+    listen_var = ctk.BooleanVar(value=bool(eff["listen"]) and phone_idx is not None)
+    listen_switch = ctk.CTkSwitch(lis, text="Слушать себя", variable=listen_var,
+                                  font=font(13, "bold"), text_color=C_TEXT,
+                                  progress_color=C_GREEN, button_color="white",
+                                  button_hover_color="#e3e5e8", fg_color="#80848e",
+                                  switch_width=44, switch_height=22)
+    listen_switch.grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=6)
+    listen_hint = ctk.CTkLabel(lis, text="звук с эффектом — как тебя слышат в Discord. "
+                               "Только в наушниках, иначе будет эхо", font=font(11),
+                               text_color=C_FAINT, anchor="w")
+    listen_hint.grid(row=2, column=0, columnspan=3, sticky="w", padx=16)
+
+    def apply_listen():
+        on = listen_var.get() and phone_idx is not None
+        settings["listen"] = bool(listen_var.get())
+        schedule_save()
+        try:
+            if on:
+                engine.set_listen(phone_idx, min(2, devices[phone_idx]["max_output_channels"]))
+            else:
+                engine.set_listen(None)
+        except Exception as e:
+            listen_var.set(False)
+            settings["listen"] = False
+            engine.set_listen(None)
+            messagebox.showerror("Автотюн", f"Не удалось открыть наушники:\n{e}")
+
+    def pick_phones(name):
+        nonlocal phone_idx
+        phone_idx = phones[phone_names.index(name)]
+        settings["listen_device"] = name
+        schedule_save()
+        if listen_var.get():
+            apply_listen()
+
+    ctk.CTkLabel(lis, text="Наушники", font=font(13), text_color=C_MUTED,
+                 anchor="w").grid(row=3, column=0, sticky="w", padx=16, pady=6)
+    phone_menu = option_menu(lis, phone_names or ["нет устройств вывода"], pick_phones, 420)
+    if phone_idx is not None:
+        phone_menu.set(devices[phone_idx]["name"])
+    else:
+        phone_menu.configure(state="disabled")
+        listen_switch.configure(state="disabled")
+    phone_menu.grid(row=3, column=1, columnspan=2, sticky="w", padx=(0, 16), pady=6)
+
+    ctk.CTkLabel(lis, text="Громкость", font=font(13), text_color=C_MUTED,
+                 anchor="w").grid(row=4, column=0, sticky="w", padx=16, pady=(6, 14))
+    listen_val = ctk.CTkLabel(lis, text=f"{eff['listen_volume'] * 100:.0f}%",
+                              font=font(13, "bold"), text_color=C_TEXT, width=64, anchor="e")
+    listen_val.grid(row=4, column=2, padx=(8, 16), pady=(6, 14))
+
+    def on_listen_volume(value):
+        engine.listen_volume = value / 100
+        settings["listen_volume"] = value / 100
+        listen_val.configure(text=f"{value:.0f}%")
+        schedule_save()
+
+    listen_slider = ctk.CTkSlider(lis, from_=0, to=100, number_of_steps=100, height=18,
+                                  command=on_listen_volume, fg_color=C_INPUT,
+                                  progress_color=C_BLURPLE, button_color="white",
+                                  button_hover_color="#e3e5e8")
+    listen_slider.set(eff["listen_volume"] * 100)
+    listen_slider.grid(row=4, column=1, sticky="we", pady=(6, 14))
+    lis.grid_columnconfigure(1, weight=1)
+    listen_switch.configure(command=apply_listen)
+
     # --- key and scale
-    ks = card("ТОНАЛЬНОСТЬ", 3)
+    ks = card("ТОНАЛЬНОСТЬ", 4)
 
     def on_scale(_=None):
         settings["key"] = key_seg.get()
@@ -1240,7 +1388,7 @@ def run_gui(args):
     scale_menu.grid(row=2, column=1, sticky="w", padx=(0, 16), pady=(6, 14))
 
     # --- sound sliders
-    snd = card("ЗВУК", 4)
+    snd = card("ЗВУК", 5)
 
     def set_speed(v): tuner.speed = v
     def set_transpose(v): tuner.transpose = v
@@ -1355,6 +1503,8 @@ def run_gui(args):
     apply_hotkey(eff["hotkey"])
     set_enabled(engine.enabled)
     open_mic(inp)
+    if listen_var.get():
+        apply_listen()
     refresh()
     root.mainloop()
 

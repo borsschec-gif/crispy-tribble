@@ -179,6 +179,32 @@ jobs:
           assert abs(peak - 440) < 2 and seg.std() > 0.05
           PY
 
+      - name: Smoke test (hear yourself - the headphone stream plays into a real device)
+        run: |
+          python - <<'PY'
+          import threading, time, numpy as np, sounddevice as sd, autotune as a
+          sr, block = 48000, 256
+          dev = [i for i, d in enumerate(sd.query_devices()) if "Autotune Mic" in d["name"]][0]
+          listen = a.Listen(sd, sr, block, dev, 2)
+          listen.volume = 0.5
+          stop = False
+          def feed():
+              n = 0
+              while not stop:
+                  t = (np.arange(block) + n) / sr
+                  listen.push((0.4 * np.sin(2 * np.pi * 330 * t)).astype(np.float32))
+                  n += block
+                  time.sleep(block / sr)
+          threading.Thread(target=feed, daemon=True).start()
+          rec = sd.rec(sr, sr, channels=1, device=dev, dtype="float32", blocking=True)[:, 0]
+          stop = True
+          listen.close()
+          seg = rec[sr // 4:]
+          peak = np.fft.rfftfreq(len(seg), 1 / sr)[np.argmax(np.abs(np.fft.rfft(seg)))]
+          print(f"heard rms {np.sqrt((seg ** 2).mean()):.3f} (expected ~0.14), peak {peak:.1f} Hz")
+          assert abs(peak - 330) < 2 and 0.07 < np.sqrt((seg ** 2).mean()) < 0.2
+          PY
+
       # Classic installer: drag the app onto the Applications folder
       - name: Build DMG
         run: |
