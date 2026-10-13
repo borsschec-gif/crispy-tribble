@@ -179,39 +179,37 @@ jobs:
           assert abs(peak - 440) < 2 and seg.std() > 0.05
           PY
 
-      - name: Smoke test (hear yourself - the headphone stream plays into a real device)
+      - name: Smoke test (hear yourself - headphones on the mic's own device, like AirPods)
         run: |
           python - <<'PY'
-          import threading, time, numpy as np, sounddevice as sd, autotune as a
+          import time, numpy as np, sounddevice as sd, autotune as a
           sr, block = 48000, 256
-          dev = [i for i, d in enumerate(sd.query_devices()) if "Autotune Mic" in d["name"]][0]
-          listen = a.Listen(sd, sr, block, dev, 2)
-          listen.volume = 0.5
-          stop = False
-          def feed():  # like the mic callback: one block per block of real time
-              n, start = 0, time.perf_counter()
-              while not stop:
-                  due = int((time.perf_counter() - start) * sr / block) + 1
-                  while n < due:
-                      t = (np.arange(block) + n * block) / sr
-                      listen.push((0.4 * np.sin(2 * np.pi * 330 * t)).astype(np.float32))
-                      n += 1
-                  time.sleep(0.001)
-          threading.Thread(target=feed, daemon=True).start()
-          # record the way the app's own mic stream runs (same block size and latency):
-          # like AirPods used as both the mic and the headphones
-          chunks = []
-          with sd.InputStream(device=dev, samplerate=sr, channels=1, dtype="float32",
-                              blocksize=block, latency="low",
-                              callback=lambda x, f, t, st: chunks.append(x[:, 0].copy())):
-              time.sleep(1.0)
-          rec = np.concatenate(chunks)
-          stop = True
-          listen.close()
-          seg = rec[len(rec) // 4:]
-          peak = np.fft.rfftfreq(len(seg), 1 / sr)[np.argmax(np.abs(np.fft.rfft(seg)))]
-          print(f"heard rms {np.sqrt((seg ** 2).mean()):.3f} (expected ~0.14), peak {peak:.1f} Hz")
-          assert abs(peak - 330) < 2 and 0.07 < np.sqrt((seg ** 2).mean()) < 0.2
+          devs = list(sd.query_devices())
+          mic = [i for i, d in enumerate(devs) if "Autotune Mic" in d["name"]][0]
+          null = [i for i, d in enumerate(devs) if "Null Audio" in d["name"]
+                  and d["max_output_channels"] > 0][0]
+          eff = dict(a.DEFAULTS, enabled=False, gain=1.0, listen_volume=1.0)
+          # loop: headphones play into the mic device, the mic hears it and feeds the
+          # headphones again; a kicked tone keeps circulating only if BOTH streams run
+          results = []
+          for trial in range(6):
+              eng = a.Engine(sd, sr, block, eff)
+              if trial % 2 == 0:
+                  eng.start(mic, null, out_channels=2); eng.set_listen(mic, 2)   # listen on
+              else:
+                  eng.set_listen(mic, 2); eng.start(mic, null, out_channels=2)   # mic switch
+              t = np.arange(block * 8) / sr
+              tone = (0.4 * np.sin(2 * np.pi * 330 * t)).astype(np.float32)
+              for k in range(4):
+                  eng.listen.push(tone[k * block:(k + 1) * block])
+              levels = []
+              for _ in range(10):
+                  time.sleep(0.1)
+                  levels.append(eng.level)
+              eng.stop()
+              results.append(min(levels[3:]))
+              print(f"trial {trial}: level after kick {min(levels[3:]):.3f}", flush=True)
+          assert all(r > 0.05 for r in results), results
           PY
 
       # Classic installer: drag the app onto the Applications folder

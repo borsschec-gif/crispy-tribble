@@ -522,7 +522,7 @@ class Listen:
     MAX_BLOCKS = 4  # caps the extra headphone latency at a few blocks
     PRIME_BLOCKS = 2  # jitter buffer: mic and headphones run on different clocks
 
-    def __init__(self, sd, sr, block, device, channels):
+    def __init__(self, sd, sr, block, device, channels, start=True):
         from collections import deque
         self.queue = deque()
         self.pending = np.zeros(0, dtype=np.float32)
@@ -531,6 +531,10 @@ class Listen:
         self.stream = sd.OutputStream(device=device, samplerate=sr, channels=channels,
                                       dtype="float32", latency="low", blocksize=block,
                                       callback=self._callback)
+        if start:
+            self.stream.start()
+
+    def start(self):
         self.stream.start()
 
     def push(self, y):
@@ -579,6 +583,8 @@ class Engine:
         self.level = 0.0
         self.stream = None
         self.listen = None
+        self.io = None  # (mic, virtual cable, cable channels)
+        self.listen_cfg = None  # (headphones, channels)
 
     def callback(self, indata, outdata, frames, time, status):
         x = indata[:, 0]
@@ -596,32 +602,56 @@ class Engine:
             listen.push(y.copy())
 
     def start(self, inp, out, mon=None, out_channels=1):
-        """(Re)open the mic -> virtual cable stream; headphones stay as they are."""
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
-        # write the same signal to both channels: some apps only listen to one
-        self.stream = self.sd.Stream(device=(inp, out), samplerate=self.sr,
-                                     blocksize=self.block, channels=(1, out_channels),
-                                     dtype="float32", latency="low", callback=self.callback)
+        """(Re)open the mic -> virtual cable stream (e.g. after picking another mic)."""
+        self.io = (inp, out, out_channels)
         if mon is not None:
-            self.set_listen(mon)
-        self.stream.start()
+            self.listen_cfg = (mon, 1)
+        self._reopen(main=True)
 
     def set_listen(self, device, channels=1):
         """Start/stop hearing yourself in headphones (device index or None)."""
-        old, self.listen = self.listen, None
-        if old is not None:
-            old.close()
-        if device is not None:
-            self.listen = Listen(self.sd, self.sr, self.block, device, channels)
+        self.listen_cfg = (device, channels) if device is not None else None
+        self._reopen(main=False)
 
-    def stop(self):
-        self.set_listen(None)
+    def _shares_device(self):
+        return (self.listen_cfg is not None and self.io is not None
+                and self.listen_cfg[0] in self.io[:2])
+
+    def _reopen(self, main):
+        """Reopen what changed. When the headphones are the mic's own device (AirPods),
+        macOS refuses to configure a device that is already running ("cannot do in
+        current context") and the late stream stays silent, so then both streams are
+        closed, created while the device is idle, and only then started."""
+        shared = self._shares_device()
+        reopen_main = (main or shared or self.stream is None) and self.io is not None
+        reopen_listen = (not main) or shared or (self.listen is None and self.listen_cfg)
+        if reopen_main:
+            self._close_main()
+        if reopen_listen:
+            self._close_listen()
+        if reopen_main:
+            inp, out, out_channels = self.io
+            # write the same signal to both channels: some apps only listen to one
+            self.stream = self.sd.Stream(device=(inp, out), samplerate=self.sr,
+                                         blocksize=self.block, channels=(1, out_channels),
+                                         dtype="float32", latency="low",
+                                         callback=self.callback)
+        listen_error = None
+        if reopen_listen and self.listen_cfg is not None:
+            device, channels = self.listen_cfg
+            try:
+                self.listen = Listen(self.sd, self.sr, self.block, device, channels,
+                                     start=False)
+            except Exception as e:  # Discord must keep hearing us even if headphones fail
+                listen_error, self.listen_cfg = e, None
+        if reopen_main:
+            self.stream.start()
+        if reopen_listen and self.listen is not None:
+            self.listen.start()
+        if listen_error is not None:
+            raise listen_error
+
+    def _close_main(self):
         if self.stream is not None:
             try:
                 self.stream.stop()
@@ -629,6 +659,15 @@ class Engine:
             except Exception:
                 pass
         self.stream = None
+
+    def _close_listen(self):
+        old, self.listen = self.listen, None
+        if old is not None:
+            old.close()
+
+    def stop(self):
+        self._close_listen()
+        self._close_main()
 
 
 # virtual cables and system aliases are not headphones
