@@ -30,7 +30,7 @@ jobs:
           pyinstaller --onefile --windowed --name autotune
           --icon assets/icon.ico --add-data "assets;assets"
           --collect-all _sounddevice_data
-          --collect-all customtkinter
+          --collect-all customtkinter --collect-data certifi
           autotune.py
 
       - name: Hotkey test (press Ctrl+Alt+A while the shortcut is registered)
@@ -62,6 +62,12 @@ jobs:
           mkdir -p package
           cp dist/autotune.exe README.md package/
           cd package && 7z a ../autotune-windows.zip *
+
+      - name: Update check over real HTTPS (GitHub) from the built exe
+        shell: bash
+        run: |
+          rc=0; ./dist/autotune.exe --check-update || rc=$?
+          echo "exit $rc"; test $rc -eq 0
 
       - name: Auto-update test (swap the exe, reject a bad file, no-op when up to date)
         shell: bash
@@ -134,7 +140,8 @@ jobs:
         run: |
           pyinstaller --windowed --name Autotune --osx-bundle-identifier com.autotune.app \
             --icon assets/icon.png --add-data "assets:assets" \
-            --collect-all _sounddevice_data --collect-all customtkinter autotune.py
+            --collect-all _sounddevice_data --collect-all customtkinter --collect-data certifi \
+            autotune.py
           APP=dist/Autotune.app
           cp -R AutotuneMic.driver "$APP/Contents/Resources/"
           cp bh/LICENSE "$APP/Contents/Resources/AutotuneMic-driver-LICENSE.txt"
@@ -169,6 +176,17 @@ jobs:
           print("presses:", hk.presses); hk.stop()
           assert hk.presses == 1
           PY
+
+      # A user's Mac has no CA files where the build machine's Python looks for them;
+      # pointing those paths nowhere reproduces that (build 17-18 failed silently here).
+      - name: Update check over real HTTPS from the app, without the build machine's CA paths
+        run: |
+          export SSL_CERT_FILE=/nonexistent SSL_CERT_DIR=/nonexistent
+          python -c "import ssl,urllib.request as u
+          try:
+              u.urlopen('https://github.com', timeout=20, context=ssl.create_default_context()); print('old way: ok (not reproduced)')
+          except Exception as e: print('old way fails as on users Macs:', e)"
+          dist/Autotune.app/Contents/MacOS/Autotune --check-update
 
       - name: Smoke test (audio processing)
         run: |

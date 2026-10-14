@@ -2,11 +2,12 @@
 """Real-time autotune for a microphone (e.g. for Discord calls).
 
 Mic -> pitch detection (YIN) -> snap to the nearest note of a scale ->
-pitch shift (two-tap crossfaded delay line) -> output device
+pitch shift (PSOLA, keeps the vowels) -> talk box / compressor -> output device
 (a virtual audio cable that Discord uses as its microphone).
 """
 import argparse
 import json
+import math
 import os
 import sys
 import wave
@@ -97,11 +98,282 @@ class PitchDetector:
         return self.sr / (tau + shift)
 
 
+def _taper(d, f, h):
+    """Window half: 1 for d <= f, cos^2 fall to 0 at d = h."""
+    if h - f <= 1e-9:
+        return (d <= f).astype(np.float64)
+    z = np.clip((d - f) / (h - f), 0.0, 1.0)
+    return np.cos(0.5 * np.pi * z) ** 2
+
+
 class PitchShifter:
+    """Pitch-synchronous overlap-add (TD-PSOLA), strictly causal.
+
+    Pitch marks are placed one period apart on the input (the first on the strongest
+    peak, every next one by normalised cross-correlation with the previous period, so
+    they follow vibrato and glides).  Every mark owns a grain one period wide on each
+    side; synthesis marks advance by period / ratio and take the nearest grain (repeated
+    when raising, skipped when lowering).  The vowels (formants) stay where they are, and
+    at ratio 1 the grains add back up to the input exactly - a voice that is already in
+    tune passes through untouched.  Unvoiced sounds pass through with the same delay.
+
+    Delay = 2 x the longest grain half-width; voices whose period does not fit
+    (below sr / max_P Hz) pass through unshifted, see AutoTune for the fallback.
+    """
+
+    FLOOR = 0.5          # window-sum floor for the normalisation
+    NCC_THR = 0.55       # periodicity needed to keep tracking
+    CENTER = 0.5         # 0: always the latest grain at/before the synthesis mark; 0.5: nearest
+    RATIO_ALIGN = True   # apply the ratio given for the input block the grain comes from
+
+    def __init__(self, sr, latency_ms=15.5):
+        self.sr = int(sr)
+        lat_ms = float(np.clip(latency_ms, 8.0, 24.0))
+        self.hmax = max(24, int(round(self.sr * lat_ms / 2000.0)))  # max grain half-width
+        self.L = 2 * self.hmax + 3
+        self.latency = self.L / self.sr
+        self.H = max(16, int(round(min(0.5 * self.hmax, 0.004 * self.sr))))  # unvoiced hop
+        self.min_P = self.sr / 1100.0
+        self.max_P = 1.8 * self.hmax
+        self.floor = float(self.FLOOR)
+        self.ncc_thr = float(self.NCC_THR)
+
+        size = 1
+        while size < 8 * (self.L + 4 * self.hmax) + 8192:
+            size <<= 1
+        self.size = size
+        self.mask = size - 1
+        self.inbuf = np.zeros(size)
+        self.acc = np.zeros(size)
+        self.ws = np.zeros(size)
+        self.rbuf = np.ones(size)
+        self.n_in = 0
+        self.n_out = -self.L
+
+        H = float(self.H)
+        # analysis marks: position, voiced, (hl, fl, hr, fr) window shape
+        self.mpos = [-H]
+        self.mvoi = [False]
+        self.mshape = [[H, 0.0, H, 0.0]]
+        self.track_P = None
+        # synthesis state: current synthesis mark and the analysis mark it uses
+        self.s = -H
+        self.si = 0
+        self.ratio = 1.0
+
+    # ------------------------------------------------------------------ helpers
+    def _read(self, i0, i1):
+        i0 = int(i0)
+        i1 = int(i1)
+        a = i0 & self.mask
+        if a + (i1 - i0) <= self.size:
+            return self.inbuf[a:a + (i1 - i0)]
+        return self.inbuf[np.arange(i0, i1) & self.mask]
+
+    def _shape(self, D):
+        h = self.hmax
+        if D <= h:
+            return max(D, 1.0), 0.0
+        return float(h), float(min(D - h, h - 2.0))
+
+    def _append(self, pos, voiced, right_dist):
+        prev = self.mpos[-1]
+        D = pos - prev
+        hl, fl = self._shape(D)
+        # make the previous grain's right half complementary to this one's left half
+        ps = self.mshape[-1]
+        ps[2], ps[3] = hl, fl
+        hr, fr = self._shape(right_dist)
+        self.mpos.append(float(pos))
+        self.mvoi.append(bool(voiced))
+        self.mshape.append([hl, fl, hr, fr])
+
+    # ------------------------------------------------------------------ analysis
+    def _gen_marks(self, f0):
+        sr = self.sr
+        Pp = sr / f0 if f0 > 0 else 0.0
+        voiced = f0 > 0 and self.min_P <= Pp <= self.max_P
+        guard = 0
+        while guard < 64:
+            guard += 1
+            last = self.mpos[-1]
+            if not voiced:
+                nxt = last + self.H
+                if nxt + self.H > self.n_in:
+                    break
+                self._append(nxt, False, self.H)
+                self.track_P = None
+                continue
+            if self.mvoi[-1] and self.track_P is not None:
+                P = self.track_P
+                if abs(math.log(P / Pp)) > 0.18:
+                    P = Pp
+                    R = 0.22 * P
+                else:
+                    R = 0.12 * P
+                R = max(R, 2.0)
+                lo = max(int(math.floor(P - R)), int(self.min_P))
+                hi = min(int(math.ceil(P + R)), int(self.max_P) + 1)
+                if hi <= lo + 2:
+                    hi = lo + 3
+                tr = int(min(0.5 * P, max(self.hmax - R - 2, 0.25 * P)))
+                tl = max(int(P) - tr, 8)
+                mi = int(round(last))
+                need = mi + tr + hi + 1
+                if need > self.n_in:
+                    break
+                tpl = self._read(mi - tl, mi + tr)
+                seg = self._read(mi - tl + lo, mi + tr + hi + 1)
+                n = len(tpl)
+                num = np.correlate(seg, tpl, mode="valid")
+                c = np.concatenate(([0.0], np.cumsum(seg * seg)))
+                eseg = c[n:] - c[:-n]
+                etpl = float(np.dot(tpl, tpl))
+                ncc = num / np.sqrt(etpl * eseg + 1e-20)
+                k = int(np.argmax(ncc))
+                best = float(ncc[k])
+                if 0 < k < len(ncc) - 1:
+                    y0, y1, y2 = ncc[k - 1], ncc[k], ncc[k + 1]
+                    den = y0 - 2 * y1 + y2
+                    dk = 0.5 * (y0 - y2) / den if den < -1e-12 else 0.0
+                    dk = float(np.clip(dk, -0.5, 0.5))
+                else:
+                    dk = 0.0
+                tau = lo + k + dk
+                if best >= self.ncc_thr and etpl > 1e-12 and self.min_P <= tau <= self.max_P:
+                    self._append(last + tau, True, tau)
+                    self.track_P = tau
+                else:
+                    self._append(last + self.H, False, self.H)
+                    self.track_P = None
+                continue
+            # acquisition of a new voiced stretch: strongest peak in the next period
+            start = int(math.floor(last)) + max(1, int(0.3 * min(self.H, Pp)))
+            end = start + int(math.ceil(Pp))
+            if end > self.n_in:
+                break
+            seg = self._read(start, end)
+            k = int(np.argmax(np.abs(seg)))
+            pos = start + k
+            self._append(pos, True, Pp)
+            self.track_P = Pp
+
+    # ------------------------------------------------------------------ synthesis
+    def _place(self, s, j):
+        a = self.mpos[j]
+        hl, fl, hr, fr = self.mshape[j]
+        u0 = int(math.floor(s - hl)) + 1
+        u1 = int(math.ceil(s + hr))
+        if u1 <= u0:
+            return
+        t = np.arange(u0, u1) - s
+        w = np.empty(len(t))
+        left = t < 0
+        w[left] = _taper(-t[left], fl, hl)
+        w[~left] = _taper(t[~left], fr, hr)
+        off = a - s
+        io = int(math.floor(off))
+        f = off - io
+        if f < 1e-9:
+            g = self._read(u0 + io, u1 + io)
+        elif f > 1.0 - 1e-9:
+            g = self._read(u0 + io + 1, u1 + io + 1)
+        else:
+            x = self._read(u0 + io - 1, u1 + io + 2)
+            n = u1 - u0
+            c0 = -f * (f - 1) * (f - 2) / 6.0
+            c1 = (f + 1) * (f - 1) * (f - 2) / 2.0
+            c2 = -(f + 1) * f * (f - 2) / 2.0
+            c3 = (f + 1) * f * (f - 1) / 6.0
+            g = c0 * x[0:n] + c1 * x[1:n + 1] + c2 * x[2:n + 2] + c3 * x[3:n + 3]
+        idx = np.arange(u0, u1) & self.mask
+        self.acc[idx] += g * w
+        self.ws[idx] += w
+
+    def _synthesize(self, E):
+        mpos, mvoi = self.mpos, self.mvoi
+        guard = 0
+        while guard < 4096:
+            guard += 1
+            i = self.si
+            s = self.s
+            nm = len(mpos)
+            j = -1
+            if mvoi[i]:
+                if i + 1 < nm and mvoi[i + 1]:
+                    Pa = mpos[i + 1] - mpos[i]
+                else:
+                    Pa = self.mshape[i][2] + self.mshape[i][3]  # expected spacing
+                if self.RATIO_ALIGN:
+                    r = self.rbuf[int(math.floor(s)) & self.mask]
+                else:
+                    r = self.ratio
+                s_new = s + Pa / r
+                delta = max(0.0, min(self.CENTER * Pa, self.hmax - Pa - 2.0))
+                jj = i
+                ok = True
+                while jj + 1 < nm and mpos[jj + 1] <= s_new + delta + 1e-6:
+                    jj += 1
+                    if not mvoi[jj]:
+                        ok = False
+                if ok and mvoi[jj]:
+                    j = jj
+                    if abs(s_new - mpos[jj]) < 1e-6:
+                        s_new = mpos[jj]
+            if j < 0:
+                # snap to the first analysis mark after the current synthesis position
+                jj = i + 1
+                while jj < nm and mpos[jj] <= s + 1e-6:
+                    jj += 1
+                if jj >= nm:
+                    break
+                j = jj
+                s_new = mpos[jj]
+            if s_new - self.hmax >= E:
+                break
+            self._place(s_new, j)
+            self.s = s_new
+            self.si = j
+        # prune old marks
+        if self.si > 48:
+            k = self.si - 8
+            del self.mpos[:k]
+            del self.mvoi[:k]
+            del self.mshape[:k]
+            self.si -= k
+
+    # ------------------------------------------------------------------ public
+    def process(self, x, ratio, f0):
+        x = np.asarray(x, dtype=np.float64)
+        n = len(x)
+        if n == 0:
+            return np.zeros(0)
+        xs = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        idx = (self.n_in + np.arange(n)) & self.mask
+        self.inbuf[idx] = xs
+        self.n_in += n
+        r = float(ratio) if np.isfinite(ratio) else 1.0
+        self.ratio = float(np.clip(r, 0.4, 2.5))
+        self.rbuf[idx] = self.ratio
+        f0 = float(f0) if np.isfinite(f0) else 0.0
+        self._gen_marks(f0)
+        E = self.n_in - self.L
+        self._synthesize(E)
+        oidx = np.arange(self.n_out, E) & self.mask
+        y = self.acc[oidx] / np.maximum(self.ws[oidx], self.floor)
+        self.acc[oidx] = 0.0
+        self.ws[oidx] = 0.0
+        self.n_out = E
+        return y
+
+
+class CartoonShifter:
     """Two read heads on a delay line, crossfaded with sin^2 windows.
 
-    Low latency and good enough for the small (<= 1 semitone) shifts
-    autotune needs.
+    Moves the vowels (formants) together with the pitch - the "chipmunk" / "demon"
+    sound - and works for any voice at very low delay.  Mixes two copies of the voice
+    with different delays, which colours a clean voice, so it is used only when that
+    character is wanted and for voices too low for PitchShifter's window.
     """
 
     def __init__(self, sr, grain_ms=30.0, buf_size=1 << 15):
@@ -144,8 +416,10 @@ class TalkBox:
     Only the talk-box path is delayed; the dry voice passes straight through.
     """
 
-    def __init__(self, sr, n_fft=1024, hop=256, lifter=40, glide=0.08, tone=0.5):
+    def __init__(self, sr, n_fft=1024, hop=256, lifter=40, glide=0.08, tone=0.5, nasal=0.0):
         self.sr = sr
+        self.nasal = nasal  # 0..1: the honk of a voice through the nose / a talk-box tube
+        self._nasal_cache = (None, None)
         self.glide = glide  # seconds for the synth to slide to a new note (portamento)
         self.tone = tone  # brightness: 0.5 = a real talk box, lower = darker, higher = brighter
         self.n = n_fft
@@ -162,6 +436,7 @@ class TalkBox:
         self.phases = np.zeros(3)  # three oscillators of the "analog" synth (cycles)
         self.freq = 0.0  # current synth pitch (glides towards the sung note)
         self.amount = 0.0  # last applied amount, ramped to avoid clicks
+        self.synth_on = False  # the synth runs only while the talk box is audible
         self.rng = np.random.default_rng(0)
 
     def _carrier(self, n, freq):
@@ -169,6 +444,8 @@ class TalkBox:
         between notes. In pauses it holds the last note, like a held key, so
         consonants are not hissy; only before the first note is there quiet noise."""
         noise = self.rng.standard_normal(n) * 0.05
+        if n == 0:
+            return noise
         if freq <= 0 and self.freq <= 0:
             return noise * 4
         target = freq if freq > 0 else self.freq
@@ -210,17 +487,43 @@ class TalkBox:
         cep[lifter:-lifter + 1] = 0.0
         return np.exp(np.fft.rfft(cep).real)
 
-    def process(self, x, freq, amount, f_voice=0.0):
+    def _nasal_shape(self):
+        """Gain curve for nasality: a honk around 1-1.6 kHz, a dip near 600 Hz where a
+        nasal voice loses energy, less low end. Cached per (n_fft, amount)."""
+        key = (self.n, round(self.nasal, 3))
+        if self._nasal_cache[0] == key:
+            return self._nasal_cache[1]
+        f = np.maximum(np.fft.rfftfreq(self.n, 1 / self.sr), 1.0)
+        a = float(np.clip(self.nasal, 0.0, 1.0))
+        lo = np.log2(f)
+        honk = 14.0 * a * np.exp(-0.5 * ((lo - np.log2(1300.0)) / 0.45) ** 2)  # dB
+        dip = -9.0 * a * np.exp(-0.5 * ((lo - np.log2(600.0)) / 0.25) ** 2)
+        hp = 1 / np.sqrt(1 + ((150.0 + 250.0 * a) / f) ** 4)  # low cut, steeper as it grows
+        shape = 10 ** ((honk + dip) / 20) * (hp if a > 0 else 1.0)
+        self._nasal_cache = (key, shape)
+        return shape
+
+    def process(self, x, freq, amount, f_voice=0.0, env_x=None):
+        """x: the voice the dry path plays; env_x: the voice whose vowels shape the synth
+        (the singer's own, unshifted voice, so a transposed talk box keeps natural
+        vowels instead of going chipmunk); f_voice: pitch of env_x."""
         # vowel envelope: smooth just below the voice's own pitch period, so the
         # formants stay sharp (a fixed smoothing blurred F1 by up to a tone)
         if f_voice > 0:
             lifter = int(np.clip(0.7 * self.sr / f_voice, 20, min(300, self.n // 2 - 1)))
         else:
             lifter = self.lifter
-        self.in_v = np.concatenate([self.in_v, x])
-        self.in_c = np.concatenate([self.in_c, self._carrier(len(x), freq)])
-        h, talk = self.hop, [self.out]
         active = amount > 0 or self.amount > 0  # self.amount: the mix actually applied
+        self.in_v = np.concatenate([self.in_v, x if env_x is None else env_x])
+        # switched off: don't spend CPU on the synth; switched on: refill its analysis
+        # window at once, so the first frames see a whole synth wave, not silence
+        if active and not self.synth_on:
+            self.carrier = self._carrier(len(self.carrier), freq)
+            self.in_c = self._carrier(len(self.in_c), freq)
+        self.synth_on = active
+        carrier = self._carrier(len(x), freq) if active else np.zeros(len(x))
+        self.in_c = np.concatenate([self.in_c, carrier])
+        h, talk = self.hop, [self.out]
         while len(self.in_v) >= h:
             self.voice = np.concatenate([self.voice[h:], self.in_v[:h]])
             self.carrier = np.concatenate([self.carrier[h:], self.in_c[:h]])
@@ -237,6 +540,8 @@ class TalkBox:
                 tilt = 2.0 + 12.0 * self.tone  # dB per octave
                 freqs = np.maximum(np.fft.rfftfreq(self.n, 1 / self.sr), 50.0)
                 Y *= (freqs / 1000.0) ** (tilt / 6.0206)
+                if self.nasal > 0:
+                    Y *= self._nasal_shape()
                 # match the loudness of the voice in this frame
                 Y *= np.sqrt(np.sum(np.abs(V) ** 2) / (np.sum(np.abs(Y) ** 2) + 1e-12))
                 self.ola += np.fft.irfft(Y, self.n) * self.win
@@ -311,10 +616,14 @@ def soft_limit(y, knee=0.85):
 class AutoTune:
     def __init__(self, sr, key=0, scale="major", speed=0.8, gate_db=-45.0, mix=1.0,
                  transpose=0.0, talkbox=0.0, talkbox_glide=0.08, talkbox_tone=0.5,
-                 compressor=0.0):
+                 compressor=0.0, talkbox_nasal=0.0, humanize=0.0, formant_shift=False):
         self.sr = sr
         self.detector = PitchDetector(sr)
         self.shifter = PitchShifter(sr)
+        self.cartoon = CartoonShifter(sr)
+        self.formant_shift = formant_shift  # True: vowels move with the pitch (cartoon)
+        self.w_cartoon = 1.0 if formant_shift else 0.0  # crossfade between the shifters
+        self.too_low = False  # voice too low for PSOLA's window (minimal-delay mode only)
         self.history = np.zeros(self.detector.frame)
         self.set_scale(key, scale)
         self.speed = float(np.clip(speed, 0.0, 1.0))
@@ -322,22 +631,29 @@ class AutoTune:
         self.mix = mix
         self.transpose = transpose
         self.talkbox = talkbox
-        self.tb = TalkBox(sr, glide=talkbox_glide, tone=talkbox_tone)
+        self.tb = TalkBox(sr, glide=talkbox_glide, tone=talkbox_tone, nasal=talkbox_nasal)
         self.comp = Compressor(sr, amount=compressor)
         self.since_detect = 1 << 30  # samples since the last pitch detection
+        self.humanize = humanize  # 0 = hard snapping .. 1 = keep vibrato and nuances
+        self.midi_s = None  # smoothed pitch for humanize
         self.correction = 0.0  # current correction in semitones
         self.f0 = 0.0
 
-    def set_latency(self, grain_ms, n_fft):
+    def set_latency(self, grain_ms, n_fft, shift_ms=15.5):
         """Smaller analysis windows = less delay (a little more artifacts on low voices)."""
-        self.shifter = PitchShifter(self.sr, grain_ms=grain_ms)
+        self.shifter = PitchShifter(self.sr, latency_ms=shift_ms)
+        self.cartoon = CartoonShifter(self.sr, grain_ms=grain_ms)
         old = self.tb
-        self.tb = TalkBox(self.sr, n_fft=n_fft, hop=n_fft // 4, glide=old.glide, tone=old.tone)
+        self.tb = TalkBox(self.sr, n_fft=n_fft, hop=n_fft // 4, glide=old.glide, tone=old.tone,
+                          nasal=old.nasal)
 
     @property
     def latency(self):
-        """Typical processing delay in seconds (the pitch shifter reads ~half a grain back)."""
-        lat = self.shifter.grain / 2 / self.sr
+        """Typical processing delay in seconds."""
+        if self.formant_shift:
+            lat = self.cartoon.grain / 2 / self.sr  # reads ~half a grain back
+        else:
+            lat = self.shifter.latency
         if self.talkbox > 0:
             lat += self.tb.latency
         return lat
@@ -354,6 +670,28 @@ class AutoTune:
     def gate_db(self, value):
         self.gate = 10 ** (value / 20)
 
+    def _humanized_target(self, f0, hard_target, n):
+        """Naturalness: keep vibrato and small expressive deviations.
+
+        The correction is computed from the pitch smoothed over ~150 ms, so vibrato
+        rides on top of the corrected note instead of being flattened; deviations
+        under ~half the dead zone are left alone, beyond the zone corrected fully."""
+        h = float(np.clip(self.humanize, 0.0, 1.0))
+        midi = 69 + 12 * np.log2(f0 / 440.0)
+        if self.midi_s is None or abs(midi - self.midi_s) > 0.45:  # new note: no lag
+            self.midi_s = midi
+        else:
+            self.midi_s += (midi - self.midi_s) * (1 - np.exp(-n / (self.sr * 0.15)))
+        base = np.floor(self.midi_s / 12) * 12
+        cands = np.concatenate([base - 12 + self.allowed, base + self.allowed,
+                                base + 12 + self.allowed])
+        slow = float(cands[np.argmin(np.abs(cands - self.midi_s))] - self.midi_s)
+        dz = 0.25 * h  # semitones
+        if dz > 0:
+            u = np.clip((abs(slow) - dz / 2) / (dz / 2), 0.0, 1.0)
+            slow *= u * u * (3 - 2 * u)  # smoothstep: untouched -> fully corrected
+        return (1 - h) * hard_target + h * slow
+
     def target_semitones(self, f0):
         midi = 69 + 12 * np.log2(f0 / 440.0)
         base = np.floor(midi / 12) * 12
@@ -366,6 +704,24 @@ class AutoTune:
             target = self.last_note
         self.last_note = target
         return target - midi
+
+    def _shift(self, x, ratio, f0):
+        """PSOLA keeps the voice clean; the delay-line shifter gives the cartoon sound and
+        covers voices too low for PSOLA's window (only in the minimal-delay mode)."""
+        n = len(x)
+        clean = self.shifter.process(x, ratio, f0)
+        cartoon = self.cartoon.process(x, ratio)  # always fed, so switching is seamless
+        if f0 > 0:  # keep the decision through pauses and consonants; a little hysteresis
+            self.too_low = self.sr / f0 > self.shifter.max_P * (0.95 if self.too_low else 1.0)
+        target = 1.0 if (self.formant_shift or self.too_low) else 0.0
+        if target == self.w_cartoon:
+            return cartoon if target else clean
+        step = n / (0.015 * self.sr)  # 15 ms crossfade
+        w_end = min(target, self.w_cartoon + step) if target > self.w_cartoon \
+            else max(target, self.w_cartoon - step)
+        w = np.linspace(self.w_cartoon, w_end, n, endpoint=False)
+        self.w_cartoon = w_end
+        return clean * np.sqrt(1 - w) + cartoon * np.sqrt(w)
 
     def process(self, x):
         x = x.astype(np.float64)
@@ -384,6 +740,8 @@ class AutoTune:
         self.f0 = f0
         if f0 > 0:
             target = self.target_semitones(f0)
+            if self.humanize > 0:
+                target = self._humanized_target(f0, target, n)
             # speed 1.0 -> instant (robotic "T-Pain"), lower -> smoother/natural
             block_s = n / self.sr
             tau = 0.002 + (1.0 - self.speed) * 0.25
@@ -391,13 +749,16 @@ class AutoTune:
             self.correction += (target - self.correction) * alpha
         else:
             self.last_note = None
+            self.midi_s = None
             self.correction *= 0.9  # relax back to no correction on silence/noise
+        if abs(self.correction) < 0.02:
+            self.correction = 0.0  # within 2 cents: leave the voice untouched (inaudible step)
 
         ratio = 2 ** ((self.correction + self.transpose) / 12)
-        wet = self.shifter.process(x, ratio)
+        wet = self._shift(x, ratio, f0)
         voice = wet * self.mix + x * (1 - self.mix)
         out = self.tb.process(voice, f0 * ratio, float(np.clip(self.talkbox, 0.0, 1.0)),
-                              f_voice=f0 * ratio)
+                              f_voice=f0, env_x=x)
         return self.comp.process(out)
 
 
@@ -426,7 +787,9 @@ def process_file(args):
     tuner = AutoTune(sr, key=parse_key(eff["key"]), scale=eff["scale"], speed=eff["speed"],
                      gate_db=eff["gate"], mix=eff["mix"], transpose=eff["transpose"],
                      talkbox=eff["talkbox"], talkbox_glide=eff["talkbox_glide"],
-                     talkbox_tone=eff["talkbox_tone"], compressor=eff["compressor"])
+                     talkbox_tone=eff["talkbox_tone"], compressor=eff["compressor"],
+                     talkbox_nasal=eff["talkbox_nasal"], humanize=eff["humanize"],
+                     formant_shift=eff["formant_shift"])
     out = np.concatenate([tuner.process(x[i:i + args.block])
                           for i in range(0, len(x), args.block)]) * eff["gain"]
     write_wav(args.file[1], out, sr)
@@ -531,6 +894,22 @@ def choose_mic(devices, hostapi, default):
         print("Нет такого номера, попробуй ещё раз.")
 
 
+def https_context():
+    """System trust store plus certifi's bundle.
+
+    The frozen macOS app has no usable system CA path (Python looks where the build
+    machine kept them), so HTTPS to GitHub failed there; Windows keeps its own store,
+    which antivirus HTTPS scanners rely on, so we add to it rather than replace it."""
+    import ssl
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
 def install_vb_cable(say=print):
     """Download VB-Audio Virtual Cable from the official site and run its setup."""
     import re
@@ -544,7 +923,8 @@ def install_vb_cable(say=print):
     try:
         say("Скачиваю VB-Audio Virtual Cable с vb-audio.com ...")
         req = urllib.request.Request(page, headers={"User-Agent": "Mozilla/5.0"})
-        html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+        html = urllib.request.urlopen(req, timeout=20, context=https_context()).read().decode(
+            "utf-8", "replace")
         m = re.search(r'href="([^"]*VBCABLE_Driver_Pack\d+\.zip)"', html)
         if not m:
             raise RuntimeError("ссылка на установщик не найдена")
@@ -552,7 +932,8 @@ def install_vb_cable(say=print):
         folder = tempfile.mkdtemp(prefix="vbcable_")
         zip_path = os.path.join(folder, "vbcable.zip")
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=60) as r, open(zip_path, "wb") as f:
+        with urllib.request.urlopen(req, timeout=60, context=https_context()) as r, \
+                open(zip_path, "wb") as f:
             f.write(r.read())
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(folder)
@@ -619,7 +1000,8 @@ def install_mac_driver(sd, say=print):
 
 DEFAULTS = {"key": "C", "scale": "chromatic", "speed": 0.9, "transpose": 0.0,
             "mix": 1.0, "talkbox": 0.0, "talkbox_glide": 0.08,
-            "talkbox_tone": 0.5, "compressor": 0.4, "gain": 1.0, "gate": -45.0,
+            "talkbox_tone": 0.5, "talkbox_nasal": 0.0, "compressor": 0.4, "humanize": 0.0,
+            "formant_shift": False, "gain": 1.0, "gate": -45.0,
             "enabled": True, "hotkey": HOTKEY_DEFAULT,
             "listen": False, "listen_volume": 0.8, "latency": "normal"}
 
@@ -649,11 +1031,11 @@ class CableMissing(LookupError):
 # How much buffering to trade for delay. Smaller blocks and analysis windows mean the
 # voice comes back sooner; on weak computers they may crackle, hence "safe".
 LATENCY_MODES = {
-    "min": {"label": "Минимальная", "block": 128, "grain_ms": 15, "n_fft": 512,
+    "min": {"label": "Минимальная", "block": 128, "grain_ms": 15, "n_fft": 512, "shift_ms": 11,
             "prime": 1, "latency": "low", "wasapi": True},
-    "normal": {"label": "Обычная", "block": 256, "grain_ms": 25, "n_fft": 1024,
+    "normal": {"label": "Обычная", "block": 256, "grain_ms": 25, "n_fft": 1024, "shift_ms": 15.5,
                "prime": 2, "latency": "low", "wasapi": True},
-    "safe": {"label": "Надёжная", "block": 512, "grain_ms": 30, "n_fft": 1024,
+    "safe": {"label": "Надёжная", "block": 512, "grain_ms": 30, "n_fft": 1024, "shift_ms": 18,
              "prime": 3, "latency": "high", "wasapi": False},
 }
 
@@ -737,7 +1119,9 @@ class Engine:
                               speed=eff["speed"], gate_db=eff["gate"], mix=eff["mix"],
                               transpose=eff["transpose"], talkbox=eff["talkbox"],
                               talkbox_glide=eff["talkbox_glide"],
-                              talkbox_tone=eff["talkbox_tone"], compressor=eff["compressor"])
+                              talkbox_tone=eff["talkbox_tone"], compressor=eff["compressor"],
+                              talkbox_nasal=eff["talkbox_nasal"], humanize=eff["humanize"],
+                              formant_shift=eff["formant_shift"])
         self.gain = eff["gain"]
         self.enabled = eff["enabled"]
         self.listen_volume = eff["listen_volume"]
@@ -759,7 +1143,7 @@ class Engine:
     def set_latency(self, key, rebuild=True):
         self.lat = LATENCY_MODES.get(key, LATENCY_MODES["normal"])
         self.block = self.lat["block"]
-        self.tuner.set_latency(self.lat["grain_ms"], self.lat["n_fft"])
+        self.tuner.set_latency(self.lat["grain_ms"], self.lat["n_fft"], self.lat["shift_ms"])
         self._wasapi_failed = False
         if rebuild and self.io is not None:
             self._rebuild()
@@ -1122,18 +1506,26 @@ SCALE_LABELS = {
 }
 
 PRESETS = {
-    "Естественно": {"speed": 0.5, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
-    "T-Pain": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0},
+    "Естественно": {"speed": 0.6, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0,
+                    "humanize": 0.85, "formant_shift": False},
+    "T-Pain": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0, "humanize": 0.0,
+               "formant_shift": False},
     # Ye "All the Love" (Bully), the opening line: André Troutman's talk box —
     # a pure, warm synth voice gliding between tuned notes
-    "Бабияй": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0,
-               "talkbox_glide": 0.1, "talkbox_tone": 0.5},
+    # higher: the synth plays an octave up while the vowels stay the singer's own
+    "Бабияй": {"speed": 1.0, "transpose": 12.0, "mix": 1.0, "talkbox": 1.0, "humanize": 0.0,
+               "talkbox_glide": 0.1, "talkbox_tone": 0.55, "talkbox_nasal": 0.65,
+               "formant_shift": False},
     "Чистый ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0,
-                        "talkbox_glide": 0.03, "talkbox_tone": 0.6},
-    "Бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0},
-    "Демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0},
+                        "humanize": 0.0, "talkbox_glide": 0.03, "talkbox_tone": 0.6,
+                        "talkbox_nasal": 0.25, "formant_shift": False},
+    "Бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0, "humanize": 0.0,
+                 "formant_shift": True},
+    "Демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0, "humanize": 0.0,
+              "formant_shift": True},
     "Сброс": {"speed": 0.9, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0, "gain": 1.0,
-              "gate": -45.0, "talkbox_glide": 0.08, "talkbox_tone": 0.5, "compressor": 0.4},
+              "gate": -45.0, "talkbox_glide": 0.08, "talkbox_tone": 0.5, "compressor": 0.4,
+              "talkbox_nasal": 0.0, "humanize": 0.0, "formant_shift": False},
 }
 
 # Discord dark theme
@@ -1421,7 +1813,7 @@ def check_update(timeout=10):
     if name is None:
         return None
     req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "autotune-updater"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=https_context()) as r:
         info = json.loads(r.read().decode("utf-8"))
     build = int(info.get("build", 0))
     sha = info.get("assets", {}).get(name)
@@ -1440,7 +1832,8 @@ def download_update(update, progress=None):
     fd, path = tempfile.mkstemp(suffix="-" + os.path.basename(update["url"]))
     digest = hashlib.sha256()
     try:
-        with urllib.request.urlopen(req, timeout=60) as r, os.fdopen(fd, "wb") as f:
+        with urllib.request.urlopen(req, timeout=60, context=https_context()) as r, \
+                os.fdopen(fd, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             done = 0
             while True:
@@ -1524,6 +1917,66 @@ def apply_update(path, relaunch=True):
         return
 
     raise RuntimeError("автообновление работает только в Windows и macOS")
+
+
+def log_update(message):
+    """Keep a short trail of what the updater did (shown on errors, kept for support)."""
+    import time
+    try:
+        path = os.path.join(settings_dir(), "update.log")
+        if os.path.exists(path) and os.path.getsize(path) > 200_000:
+            os.remove(path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n")
+    except OSError:
+        pass
+
+
+def is_offline_error(e):
+    """No network / GitHub unreachable: retry quietly. TLS and other errors are real."""
+    import socket
+    import ssl
+    import urllib.error
+    reason = getattr(e, "reason", e)
+    if isinstance(reason, ssl.SSLError):
+        return False
+    return isinstance(e, (urllib.error.URLError, socket.timeout, TimeoutError,
+                          ConnectionError)) and not isinstance(e, urllib.error.HTTPError)
+
+
+UPDATE_ERROR_FILE = "update_error.txt"
+
+
+def remember_update_error(text):
+    try:
+        with open(os.path.join(settings_dir(), UPDATE_ERROR_FILE), "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
+
+
+def pop_update_error():
+    path = os.path.join(settings_dir(), UPDATE_ERROR_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read().strip()
+        os.remove(path)
+        return text or None
+    except OSError:
+        return None
+
+
+def check_update_cli():
+    """--check-update: exit 0 and say whether a newer build exists, exit 1 on any error."""
+    try:
+        found = check_update()
+    except Exception as e:
+        print(f"error: {type(e).__name__}: {e}")
+        log_update(f"check failed: {type(e).__name__}: {e}")
+        return 1
+    print(f"update available: build {found['build']}" if found
+          else f"up to date (build {BUILD})")
+    return 0
 
 
 def update_now(relaunch):
@@ -1973,6 +2426,8 @@ def run_gui(args):
     def set_glide(v): tuner.tb.glide = v
     def set_tone(v): tuner.tb.tone = v
     def set_comp(v): tuner.comp.amount = v
+    def set_humanize(v): tuner.humanize = v
+    def set_nasal(v): tuner.tb.nasal = v
     def set_gain(v): engine.gain = v
     def set_gate(v): tuner.gate_db = v
 
@@ -1983,6 +2438,8 @@ def run_gui(args):
     slider_defs = [
         ("speed", "Скорость подтяжки", "100% — роботизированный эффект", 0, 100, 100,
          lambda v: v * 100, lambda u: u / 100, pct, set_speed),
+        ("humanize", "Естественность", "оставляет вибрато и мелкие нюансы, правит только фальшь",
+         0, 100, 100, lambda v: v * 100, lambda u: u / 100, pct, set_humanize),
         ("talkbox", "Ток-бокс", "синтезатор, который «поёт» твоими гласными", 0, 100, 100,
          lambda v: v * 100, lambda u: u / 100, pct, set_talkbox),
         ("talkbox_glide", "Глайд ток-бокса", "за сколько голос доезжает до новой ноты",
@@ -1994,6 +2451,8 @@ def run_gui(args):
          lambda v: v, lambda u: float(round(u)), lambda v: f"{v:+.0f}", set_transpose),
         ("mix", "Сила эффекта", "смесь с чистым голосом", 0, 100, 100,
          lambda v: v * 100, lambda u: u / 100, pct, set_mix),
+        ("talkbox_nasal", "Гнусавость ток-бокса", "звук «в нос», как через трубку ток-бокса",
+         0, 100, 100, lambda v: v * 100, lambda u: u / 100, pct, set_nasal),
         ("compressor", "Компрессор", "выравнивает громкость: тихое громче, громкое тише",
          0, 100, 100, lambda v: v * 100, lambda u: u / 100, pct, set_comp),
         ("gain", "Громкость", "", 0, 200, 200,
@@ -2004,7 +2463,7 @@ def run_gui(args):
     sliders = {}
     for r, (key, title, hint_text, lo, hi, steps, to_ui, from_ui, fmt, apply) in \
             enumerate(slider_defs, start=1):
-        last = r == len(slider_defs)
+        last = False  # the cartoon switch goes below the sliders
         labels = ctk.CTkFrame(snd, fg_color="transparent")
         labels.grid(row=r, column=0, sticky="w", padx=16, pady=(6, 14 if last else 6))
         ctk.CTkLabel(labels, text=title, font=font(13), text_color=C_TEXT, anchor="w",
@@ -2033,8 +2492,33 @@ def run_gui(args):
         slider.grid(row=r, column=1, sticky="we", pady=(6, 14 if last else 6))
         sliders[key] = (slider, to_ui, on_move)
 
+    # vowels move with the pitch: the chipmunk / demon sound instead of a clean shift
+    cartoon_var = ctk.BooleanVar(value=bool(eff["formant_shift"]))
+
+    def on_cartoon(manual=True):
+        tuner.formant_shift = bool(cartoon_var.get())
+        settings["formant_shift"] = tuner.formant_shift
+        if manual:
+            highlight_preset(None)
+        schedule_save()
+
+    row = len(slider_defs) + 1
+    labels = ctk.CTkFrame(snd, fg_color="transparent")
+    labels.grid(row=row, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 14))
+    cartoon_switch = ctk.CTkSwitch(labels, text="Мультяшный тембр", variable=cartoon_var,
+                                   font=font(13), text_color=C_TEXT, progress_color=C_GREEN,
+                                   command=on_cartoon)
+    cartoon_switch.pack(anchor="w")
+    ctk.CTkLabel(labels, text="тембр меняется вместе с высотой, как у бурундука; "
+                              "выключено — голос остаётся твоим",
+                 font=font(11), text_color=C_FAINT, anchor="w", height=14).pack(anchor="w")
+
     def apply_preset(name):
         for k, v in PRESETS[name].items():
+            if k == "formant_shift":
+                cartoon_var.set(bool(v))
+                on_cartoon(manual=False)
+                continue
             slider, to_ui, on_move = sliders[k]
             slider.set(to_ui(v))
             on_move(slider.get(), manual=False)
@@ -2059,29 +2543,38 @@ def run_gui(args):
     # closed (never a restart in the middle of a call); re-checked every 6 hours
     import threading
     import time as _time
-    update_state = {"path": None, "build": None}
+    update_state = {"path": None, "build": None, "error": pop_update_error()}
 
     def update_worker():
         while True:
             try:
                 found = check_update()
+                update_state["error"] = None
                 if found and found["build"] != update_state["build"]:
+                    log_update(f"downloading build {found['build']}")
                     path = download_update(found)
                     old, update_state["path"] = update_state["path"], path
                     update_state["build"] = found["build"]
+                    log_update(f"build {found['build']} ready: {path}")
                     if old:
                         try:
                             os.remove(old)
                         except OSError:
                             pass
-            except Exception:
-                pass  # offline or GitHub unreachable: try again later
+            except Exception as e:
+                log_update(f"failed: {type(e).__name__}: {e}")
+                if not is_offline_error(e):  # offline: just try again later
+                    update_state["error"] = f"{type(e).__name__}: {e}"
             _time.sleep(6 * 3600)
 
     def poll_update():
         if update_state["path"]:
             show(update_lbl, text=f"сборка {update_state['build']} скачана — "
-                                  "установится, когда закроешь программу   ·")
+                                  "установится, когда закроешь программу   ·",
+                 text_color=C_GREEN)
+        elif update_state["error"]:
+            show(update_lbl, text="автообновление: " + update_state["error"][:70] + "   ·",
+                 text_color=C_RED)
         root.after(2000, poll_update)
 
     if updates_supported():
@@ -2133,8 +2626,12 @@ def run_gui(args):
     if update_state["path"]:
         try:
             apply_update(update_state["path"], relaunch=False)  # next launch is the new build
-        except Exception:
-            pass  # e.g. no write access: the old build keeps working, retried next time
+            log_update(f"build {update_state['build']} installed")
+        except Exception as e:
+            # e.g. started from the DMG or no write access: the old build keeps working,
+            # the reason is shown in the window next time
+            log_update(f"install failed: {type(e).__name__}: {e}")
+            remember_update_error(f"не установилась: {e}")
 
 
 def main():
@@ -2161,12 +2658,18 @@ def main():
     p.add_argument("--transpose", type=float,
                    help="сдвиг в полутонах (например 12 или -5)")
     p.add_argument("--mix", type=float, help="0..1, доля обработанного звука")
+    p.add_argument("--formant-shift", action=argparse.BooleanOptionalAction, default=None,
+                   help="мультяшный тембр: тембр меняется вместе с высотой (как у бурундука)")
+    p.add_argument("--humanize", type=float,
+                   help="0..1, естественность: сохранить вибрато и мелкие нюансы голоса")
     p.add_argument("--talkbox", type=float,
                    help="0..1, эффект ток-бокса (синтезатор, который «говорит» твоим голосом)")
     p.add_argument("--talkbox-glide", dest="talkbox_glide", type=float,
                    help="ток-бокс: за сколько секунд голос доезжает до новой ноты (0.08)")
     p.add_argument("--talkbox-tone", dest="talkbox_tone", type=float,
                    help="ток-бокс: яркость 0..1 (0.5 — как настоящий ток-бокс)")
+    p.add_argument("--talkbox-nasal", dest="talkbox_nasal", type=float,
+                   help="ток-бокс: гнусавость 0..1")
     p.add_argument("--compressor", type=float,
                    help="0..1, компрессор: выравнивает громкость (0 — выкл., по умолчанию 0.4)")
     p.add_argument("--gain", type=float, help="громкость на выходе")
@@ -2183,6 +2686,7 @@ def main():
                    help="проверить обновления и установить, если есть")
     p.add_argument("--no-relaunch", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--version", action="store_true", help="показать номер сборки")
+    p.add_argument("--check-update", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--file", nargs=2, metavar=("IN.wav", "OUT.wav"),
                    help="обработать файл вместо живого звука (для проверки)")
     args = p.parse_args()
@@ -2194,6 +2698,8 @@ def main():
     if args.version:
         print(f"сборка {BUILD} ({COMMIT[:7]})")
         return
+    if args.check_update:
+        sys.exit(check_update_cli())
     if args.update_now:
         sys.exit(update_now(relaunch=not args.no_relaunch))
     if args.print_driver_install:
