@@ -1449,11 +1449,10 @@ def run_gui(args):
     ctk.CTkFrame(top, width=1, height=24, fg_color=C_SELECTED).pack(side="left", padx=12)
     ctk.CTkLabel(top, text="Все изменения применяются сразу, прямо во время звонка",
                  font=font(12), text_color=C_FAINT).pack(side="left")
-    update_btn = ctk.CTkButton(top, text="", height=30, corner_radius=4, font=font(12, "bold"),
-                               fg_color=C_BLURPLE, hover_color=C_BLURPLE_HOVER,
-                               text_color="white")
     ctk.CTkLabel(top, text=f"сборка {BUILD}" if BUILD else "из исходников", font=font(11),
                  text_color=C_FAINT).pack(side="right", padx=16)
+    update_lbl = ctk.CTkLabel(top, text="", font=font(11), text_color=C_GREEN)
+    update_lbl.pack(side="right")
     ctk.CTkFrame(main, height=1, corner_radius=0, fg_color=C_LINE).grid(row=1, column=0,
                                                                          sticky="we")
 
@@ -1809,64 +1808,39 @@ def run_gui(args):
             shown[widget] = kw
             widget.configure(**kw)
 
-    # --- updates: checked in the background, offered with a button in the header
+    # --- updates: downloaded silently in the background, installed when the app is
+    # closed (never a restart in the middle of a call); re-checked every 6 hours
     import threading
-    update_state = {"found": None, "progress": None, "done": None, "error": None}
+    import time as _time
+    update_state = {"path": None, "build": None}
 
-    def check_in_background():
-        try:
-            update_state["found"] = check_update()
-        except Exception:
-            pass  # offline or GitHub unreachable: just no update this time
-
-    def install_update():
-        update = update_state["found"]
-        update_btn.configure(state="disabled", text="Скачиваю… 0%")
-
-        def work():
+    def update_worker():
+        while True:
             try:
-                path = download_update(update, progress=lambda p: update_state.update(progress=p))
-                update_state["done"] = path
-            except Exception as e:
-                update_state["error"] = e
-
-        threading.Thread(target=work, daemon=True).start()
+                found = check_update()
+                if found and found["build"] != update_state["build"]:
+                    path = download_update(found)
+                    old, update_state["path"] = update_state["path"], path
+                    update_state["build"] = found["build"]
+                    if old:
+                        try:
+                            os.remove(old)
+                        except OSError:
+                            pass
+            except Exception:
+                pass  # offline or GitHub unreachable: try again later
+            _time.sleep(6 * 3600)
 
     def poll_update():
-        if update_state["found"] and not update_btn.winfo_ismapped():
-            update_btn.configure(text=f"Обновить до сборки {update_state['found']['build']}",
-                                 command=install_update)
-            update_btn.pack(side="right", padx=(0, 4), pady=9)
-        if update_state["progress"] is not None and update_state["done"] is None:
-            update_btn.configure(text=f"Скачиваю… {update_state['progress'] * 100:.0f}%")
-        if update_state["error"] is not None:
-            err, update_state["error"] = update_state["error"], None
-            update_btn.configure(state="normal", text="Обновить ещё раз")
-            if messagebox.askyesno("Автотюн", f"Не получилось обновиться:\n{err}\n\n"
-                                   "Открыть страницу загрузки, чтобы скачать вручную?"):
-                import webbrowser
-                webbrowser.open(RELEASES_PAGE)
-        if update_state["done"] is not None:
-            path, update_state["done"] = update_state["done"], None
-            update_btn.configure(text="Устанавливаю…")
-            save_settings(settings)
-            try:
-                apply_update(path, relaunch=True)
-            except Exception as e:
-                update_btn.configure(state="normal", text="Обновить ещё раз")
-                if messagebox.askyesno("Автотюн", f"Не получилось обновиться:\n{e}\n\n"
-                                       "Открыть страницу загрузки, чтобы скачать вручную?"):
-                    import webbrowser
-                    webbrowser.open(RELEASES_PAGE)
-            else:
-                on_close()  # the new version starts by itself
-                return
-        root.after(300, poll_update)
+        if update_state["path"]:
+            show(update_lbl, text=f"сборка {update_state['build']} скачана — "
+                                  "установится, когда закроешь программу   ·")
+        root.after(2000, poll_update)
 
     if updates_supported():
         cleanup_old_update()
-        threading.Thread(target=check_in_background, daemon=True).start()
-        root.after(300, poll_update)
+        threading.Thread(target=update_worker, daemon=True).start()
+        root.after(2000, poll_update)
 
     def refresh():
         f0 = tuner.f0
@@ -1906,6 +1880,11 @@ def run_gui(args):
         apply_listen()
     refresh()
     root.mainloop()
+    if update_state["path"]:
+        try:
+            apply_update(update_state["path"], relaunch=False)  # next launch is the new build
+        except Exception:
+            pass  # e.g. no write access: the old build keeps working, retried next time
 
 
 def main():
