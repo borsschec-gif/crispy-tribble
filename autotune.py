@@ -105,6 +105,7 @@ class PitchShifter:
     """
 
     def __init__(self, sr, grain_ms=30.0, buf_size=1 << 15):
+        self.sr = sr
         self.grain = sr * grain_ms / 1000.0
         self.buf = np.zeros(buf_size)
         self.mask = buf_size - 1
@@ -140,14 +141,13 @@ class TalkBox:
     """Talk box / vocoder: a synth playing the exact tuned note, shaped by the
     vowels (spectral envelope) of the voice. Streaming STFT, ~20 ms latency.
 
-    The signal is always delayed by the same amount, so turning the effect
-    on and off does not click.
+    Only the talk-box path is delayed; the dry voice passes straight through.
     """
 
     def __init__(self, sr, n_fft=1024, hop=256, lifter=40, glide=0.08, tone=0.5):
         self.sr = sr
         self.glide = glide  # seconds for the synth to slide to a new note (portamento)
-        self.tone = tone  # 0 = dark, muffled tube .. 1 = bright
+        self.tone = tone  # brightness: 0.5 = a real talk box, lower = darker, higher = brighter
         self.n = n_fft
         self.hop = hop
         self.lifter = lifter
@@ -205,47 +205,113 @@ class TalkBox:
         y[hi] -= x * x + x + x + 1
         return y
 
-    def _envelope(self, mag):
+    def _envelope(self, mag, lifter):
         cep = np.fft.irfft(np.log(mag + 1e-9))
-        cep[self.lifter:-self.lifter + 1] = 0.0
+        cep[lifter:-lifter + 1] = 0.0
         return np.exp(np.fft.rfft(cep).real)
 
-    def process(self, x, freq, amount):
+    def process(self, x, freq, amount, f_voice=0.0):
+        # vowel envelope: smooth just below the voice's own pitch period, so the
+        # formants stay sharp (a fixed smoothing blurred F1 by up to a tone)
+        if f_voice > 0:
+            lifter = int(np.clip(0.7 * self.sr / f_voice, 20, min(300, self.n // 2 - 1)))
+        else:
+            lifter = self.lifter
         self.in_v = np.concatenate([self.in_v, x])
         self.in_c = np.concatenate([self.in_c, self._carrier(len(x), freq)])
-        h, out = self.hop, [self.out]
+        h, talk = self.hop, [self.out]
+        active = amount > 0 or self.amount > 0  # self.amount: the mix actually applied
         while len(self.in_v) >= h:
             self.voice = np.concatenate([self.voice[h:], self.in_v[:h]])
             self.carrier = np.concatenate([self.carrier[h:], self.in_c[:h]])
             self.in_v, self.in_c = self.in_v[h:], self.in_c[h:]
-            if amount > 0 or self.amount > 0:
+            if active:
                 V = np.fft.rfft(self.voice * self.win)
                 C = np.fft.rfft(self.carrier * self.win)
-                env_v = self._envelope(np.abs(V))
-                env_c = self._envelope(np.abs(C))
+                env_v = self._envelope(np.abs(V), lifter)
+                env_c = self._envelope(np.abs(C), self.lifter)
                 Y = C * (env_v / env_c)
-                # the tube in the mouth rounds off the highs; "tone" sets how much
-                fc = 1800.0 * 5.0 ** self.tone
-                freqs = np.fft.rfftfreq(self.n, 1 / self.sr)
-                Y /= np.sqrt(1 + (freqs / fc) ** 4)
+                # The voice's envelope carries the vocal cords' steep roll-off, which a
+                # synth through the mouth does not have: a talk box is brighter than the
+                # voice. +8 dB/oct (tone 0.5) matched a physical talk-box model best.
+                tilt = 2.0 + 12.0 * self.tone  # dB per octave
+                freqs = np.maximum(np.fft.rfftfreq(self.n, 1 / self.sr), 50.0)
+                Y *= (freqs / 1000.0) ** (tilt / 6.0206)
                 # match the loudness of the voice in this frame
                 Y *= np.sqrt(np.sum(np.abs(V) ** 2) / (np.sum(np.abs(Y) ** 2) + 1e-12))
                 self.ola += np.fft.irfft(Y, self.n) * self.win
-            talk = self.ola[:h] / self.norm
+            talk.append(self.ola[:h] / self.norm)
             self.ola = np.concatenate([self.ola[h:], np.zeros(h)])
-            dry = self.voice[:h]
-            a = np.linspace(self.amount, amount, h, endpoint=False)
-            self.amount = amount
-            # equal-power crossfade: the two signals are mostly uncorrelated
-            out.append(dry * np.sqrt(1 - a) + talk * np.sqrt(a))
-        self.out = np.concatenate(out)
-        y, self.out = self.out[:len(x)], self.out[len(x):]
+        self.out = np.concatenate(talk)
+        t, self.out = self.out[:len(x)], self.out[len(x):]
+        # The dry voice is NOT delayed: without the talk box there is no extra latency.
+        # Equal-power crossfade, the two signals are mostly uncorrelated.
+        # glide the mix towards the target over ~20 ms so switching presets is soft
+        step = 1.0 / (0.02 * self.sr)
+        delta = np.clip(amount - self.amount, -step * len(x), step * len(x))
+        a = np.clip(self.amount + np.sign(delta) * step * np.arange(1, len(x) + 1),
+                    min(self.amount, amount), max(self.amount, amount))
+        self.amount = float(a[-1]) if len(a) else self.amount
+        if not active:
+            return x.copy()
+        return x * np.sqrt(1 - a) + t * np.sqrt(a)
+
+    @property
+    def latency(self):
+        """Delay of the talk-box path in seconds."""
+        return self.n / self.sr
+
+
+class Compressor:
+    """Evens out the voice: loud parts get quieter, quiet ones louder (auto make-up).
+
+    One knob: amount 0 (off) .. 1 (heavy). Gain is computed per block from the RMS
+    and ramped across the block, so there are no clicks and no added latency.
+    """
+
+    def __init__(self, sr, amount=0.4, attack=0.005, release=0.12):
+        self.sr = sr
+        self.amount = amount
+        self.attack = attack
+        self.release = release
+        self.gain_db = 0.0
+        self.reduction_db = 0.0  # current gain reduction, for the meter
+
+    def process(self, y):
+        a = float(np.clip(self.amount, 0.0, 1.0))
+        n = len(y)
+        if n == 0:
+            return y
+        threshold = -12.0 - 18.0 * a  # dBFS
+        ratio = 1.0 + 5.0 * a
+        makeup = -threshold * (1 - 1 / ratio) * 0.6 if a > 0 else 0.0
+        level = 10 * np.log10(np.mean(y * y) + 1e-12)
+        over = level - threshold
+        target = -over * (1 - 1 / ratio) if (a > 0 and over > 0) else 0.0
+        tau = self.attack if target < self.gain_db else self.release
+        new = self.gain_db + (target - self.gain_db) * (1 - np.exp(-n / (self.sr * tau)))
+        ramp = np.linspace(self.gain_db, new, n, endpoint=False)
+        self.gain_db = new
+        self.reduction_db = -new
+        return soft_limit(y * 10 ** ((ramp + makeup) / 20))
+
+
+def soft_limit(y, knee=0.85):
+    """Transparent below the knee, rounds peaks off smoothly so they never pass 1.0."""
+    mag = np.abs(y)
+    over = mag > knee
+    if not over.any():
         return y
+    out = y.copy()
+    room = 1.0 - knee
+    out[over] = np.sign(y[over]) * (knee + room * np.tanh((mag[over] - knee) / room))
+    return out
 
 
 class AutoTune:
     def __init__(self, sr, key=0, scale="major", speed=0.8, gate_db=-45.0, mix=1.0,
-                 transpose=0.0, talkbox=0.0, talkbox_glide=0.08, talkbox_tone=0.5):
+                 transpose=0.0, talkbox=0.0, talkbox_glide=0.08, talkbox_tone=0.5,
+                 compressor=0.0):
         self.sr = sr
         self.detector = PitchDetector(sr)
         self.shifter = PitchShifter(sr)
@@ -257,8 +323,24 @@ class AutoTune:
         self.transpose = transpose
         self.talkbox = talkbox
         self.tb = TalkBox(sr, glide=talkbox_glide, tone=talkbox_tone)
+        self.comp = Compressor(sr, amount=compressor)
+        self.since_detect = 1 << 30  # samples since the last pitch detection
         self.correction = 0.0  # current correction in semitones
         self.f0 = 0.0
+
+    def set_latency(self, grain_ms, n_fft):
+        """Smaller analysis windows = less delay (a little more artifacts on low voices)."""
+        self.shifter = PitchShifter(self.sr, grain_ms=grain_ms)
+        old = self.tb
+        self.tb = TalkBox(self.sr, n_fft=n_fft, hop=n_fft // 4, glide=old.glide, tone=old.tone)
+
+    @property
+    def latency(self):
+        """Typical processing delay in seconds (the pitch shifter reads ~half a grain back)."""
+        lat = self.shifter.grain / 2 / self.sr
+        if self.talkbox > 0:
+            lat += self.tb.latency
+        return lat
 
     def set_scale(self, key, scale):
         self.allowed = np.array(sorted((key + s) % 12 for s in SCALES[scale]))
@@ -291,7 +373,14 @@ class AutoTune:
         self.history = np.concatenate([self.history[n:], x])[-self.detector.frame:]
 
         rms = np.sqrt(np.mean(x * x)) if n else 0.0
-        f0 = self.detector.detect(self.history) if rms > self.gate else 0.0
+        self.since_detect += n
+        if rms <= self.gate:
+            f0 = 0.0
+        elif self.since_detect >= 256:  # small blocks: detect every ~5 ms, not every block
+            f0 = self.detector.detect(self.history)
+            self.since_detect = 0
+        else:
+            f0 = self.f0
         self.f0 = f0
         if f0 > 0:
             target = self.target_semitones(f0)
@@ -307,7 +396,9 @@ class AutoTune:
         ratio = 2 ** ((self.correction + self.transpose) / 12)
         wet = self.shifter.process(x, ratio)
         voice = wet * self.mix + x * (1 - self.mix)
-        return self.tb.process(voice, f0 * ratio, float(np.clip(self.talkbox, 0.0, 1.0)))
+        out = self.tb.process(voice, f0 * ratio, float(np.clip(self.talkbox, 0.0, 1.0)),
+                              f_voice=f0 * ratio)
+        return self.comp.process(out)
 
 
 def read_wav(path):
@@ -335,7 +426,7 @@ def process_file(args):
     tuner = AutoTune(sr, key=parse_key(eff["key"]), scale=eff["scale"], speed=eff["speed"],
                      gate_db=eff["gate"], mix=eff["mix"], transpose=eff["transpose"],
                      talkbox=eff["talkbox"], talkbox_glide=eff["talkbox_glide"],
-                     talkbox_tone=eff["talkbox_tone"])
+                     talkbox_tone=eff["talkbox_tone"], compressor=eff["compressor"])
     out = np.concatenate([tuner.process(x[i:i + args.block])
                           for i in range(0, len(x), args.block)]) * eff["gain"]
     write_wav(args.file[1], out, sr)
@@ -528,9 +619,9 @@ def install_mac_driver(sd, say=print):
 
 DEFAULTS = {"key": "C", "scale": "chromatic", "speed": 0.9, "transpose": 0.0,
             "mix": 1.0, "talkbox": 0.0, "talkbox_glide": 0.08,
-            "talkbox_tone": 0.5, "gain": 1.0, "gate": -45.0,
+            "talkbox_tone": 0.5, "compressor": 0.4, "gain": 1.0, "gate": -45.0,
             "enabled": True, "hotkey": HOTKEY_DEFAULT,
-            "listen": False, "listen_volume": 0.8}
+            "listen": False, "listen_volume": 0.8, "latency": "normal"}
 
 
 def effective_settings(args, settings):
@@ -540,6 +631,8 @@ def effective_settings(args, settings):
         v = getattr(args, k, None)
         if v is not None:
             eff[k] = NOTE_NAMES[v] if k == "key" else v
+    if eff["latency"] not in LATENCY_MODES:
+        eff["latency"] = DEFAULTS["latency"]
     if eff["scale"] not in SCALES:
         eff["scale"] = DEFAULTS["scale"]
     try:
@@ -553,25 +646,51 @@ class CableMissing(LookupError):
     pass
 
 
-class Listen:
-    """Plays the processed voice into headphones on its own stream.
+# How much buffering to trade for delay. Smaller blocks and analysis windows mean the
+# voice comes back sooner; on weak computers they may crackle, hence "safe".
+LATENCY_MODES = {
+    "min": {"label": "Минимальная", "block": 128, "grain_ms": 15, "n_fft": 512,
+            "prime": 1, "latency": "low", "wasapi": True},
+    "normal": {"label": "Обычная", "block": 256, "grain_ms": 25, "n_fft": 1024,
+               "prime": 2, "latency": "low", "wasapi": True},
+    "safe": {"label": "Надёжная", "block": 512, "grain_ms": 30, "n_fft": 1024,
+             "prime": 3, "latency": "high", "wasapi": False},
+}
 
-    The main callback only drops blocks into a short queue, so a slow or
-    unplugged headphone device can never stall what Discord hears.
+
+def wasapi_twin(devices, index, kind, wasapi_api):
+    """The same physical device under Windows WASAPI (MME truncates names to 31 chars)."""
+    name = devices[index]["name"]
+    key = "max_input_channels" if kind == "input" else "max_output_channels"
+    found = [j for j, d in enumerate(devices)
+             if d["hostapi"] == wasapi_api and d[key] > 0
+             and (d["name"].startswith(name) or name.startswith(d["name"][:31]))]
+    return min(found, key=lambda j: len(devices[j]["name"])) if found else None
+
+
+class Listen:
+    """Plays audio from a short queue on its own output stream (headphones, or the
+    virtual cable when the headphones share the mic's device).
+
+    The producing callback only drops blocks into the queue, so a slow or
+    unplugged device can never stall the other stream.
     """
 
-    MAX_BLOCKS = 4  # caps the extra headphone latency at a few blocks
-    PRIME_BLOCKS = 2  # jitter buffer: mic and headphones run on different clocks
+    MAX_BLOCKS = 4  # caps the extra latency at a few blocks
 
-    def __init__(self, sd, sr, block, device, channels, start=True):
+    def __init__(self, sd, sr, block, device, channels, start=True, prime=2,
+                 latency="low", extra_settings=None):
         from collections import deque
         self.queue = deque()
         self.pending = np.zeros(0, dtype=np.float32)
         self.primed = False
+        self.prime = prime  # jitter buffer: the two devices run on different clocks
+        self.block = block
         self.volume = 1.0
+        kw = {"extra_settings": extra_settings} if extra_settings is not None else {}
         self.stream = sd.OutputStream(device=device, samplerate=sr, channels=channels,
-                                      dtype="float32", latency="low", blocksize=block,
-                                      callback=self._callback)
+                                      dtype="float32", latency=latency, blocksize=block,
+                                      callback=self._callback, **kw)
         if start:
             self.stream.start()
 
@@ -580,12 +699,12 @@ class Listen:
 
     def push(self, y):
         self.queue.append(y)
-        while len(self.queue) > self.MAX_BLOCKS:
+        while len(self.queue) > max(self.MAX_BLOCKS, self.prime + 2):
             self.queue.popleft()
 
     def _callback(self, outdata, frames, time, status):
         out = np.zeros(frames, dtype=np.float32)
-        if not self.primed and len(self.queue) >= self.PRIME_BLOCKS:
+        if not self.primed and len(self.queue) >= self.prime:
             self.primed = True
         filled = 0
         while self.primed and filled < frames:
@@ -609,17 +728,16 @@ class Listen:
 
 
 class Engine:
-    """Audio stream around an AutoTune whose parameters may change at any time."""
+    """Audio streams around an AutoTune whose parameters may change at any time."""
 
     def __init__(self, sd, sr, block, eff):
         self.sd = sd
         self.sr = sr
-        self.block = block
         self.tuner = AutoTune(sr, key=parse_key(eff["key"]), scale=eff["scale"],
                               speed=eff["speed"], gate_db=eff["gate"], mix=eff["mix"],
                               transpose=eff["transpose"], talkbox=eff["talkbox"],
                               talkbox_glide=eff["talkbox_glide"],
-                              talkbox_tone=eff["talkbox_tone"])
+                              talkbox_tone=eff["talkbox_tone"], compressor=eff["compressor"])
         self.gain = eff["gain"]
         self.enabled = eff["enabled"]
         self.listen_volume = eff["listen_volume"]
@@ -630,7 +748,90 @@ class Engine:
         self.mode = None  # "normal" | "shared"
         self.io = None  # (mic, virtual cable, cable channels)
         self.listen_cfg = None  # (headphones, channels)
+        self.devices = None  # device list, needed to find WASAPI twins on Windows
+        self.api = None  # host API actually in use, for the window
+        self._wasapi_failed = False
+        self.block = block
+        self.lat = LATENCY_MODES["normal"]
+        self.set_latency(eff.get("latency", "normal"), rebuild=False)
 
+    # ----- latency
+    def set_latency(self, key, rebuild=True):
+        self.lat = LATENCY_MODES.get(key, LATENCY_MODES["normal"])
+        self.block = self.lat["block"]
+        self.tuner.set_latency(self.lat["grain_ms"], self.lat["n_fft"])
+        self._wasapi_failed = False
+        if rebuild and self.io is not None:
+            self._rebuild()
+
+    def latency_estimate(self):
+        """(headphones, discord) delay in seconds, from the streams' own reports."""
+        def lat(stream, i=None):
+            v = getattr(stream, "latency", 0.0) if stream is not None else 0.0
+            if isinstance(v, (tuple, list)):
+                v = v[i if i is not None else -1]
+            return float(v or 0.0)
+        proc = self.tuner.latency + self.block / self.sr
+        mic_in = lat(self.stream, 0)
+        if self.mode == "shared":
+            phones = mic_in + proc + lat(self.stream, 1)
+            cable = mic_in + proc + self.cable.prime * self.block / self.sr + lat(
+                self.cable.stream if self.cable else None)
+            return phones, cable
+        cable = mic_in + proc + lat(self.stream, 1)
+        phones = None
+        if self.listen is not None:
+            phones = (mic_in + proc + self.listen.prime * self.block / self.sr
+                      + lat(self.listen.stream))
+        return phones, cable
+
+    # ----- host API (Windows: WASAPI is far quicker than MME, with MME as a fallback)
+    def _use_wasapi(self):
+        if sys.platform != "win32" or not self.lat["wasapi"] or self._wasapi_failed:
+            return None
+        if self.devices is None or not hasattr(self.sd, "query_hostapis"):
+            return None
+        for i, h in enumerate(self.sd.query_hostapis()):
+            if "WASAPI" in h["name"]:
+                return i
+        return None
+
+    def _route(self, index, kind):
+        """Device index to open (WASAPI twin when possible) and its extra settings."""
+        api = self._use_wasapi()
+        if api is None:
+            return index, None
+        twin = wasapi_twin(self.devices, index, kind, api)
+        if twin is None:
+            raise LookupError("нет WASAPI-версии устройства")
+        return twin, self.sd.WasapiSettings(auto_convert=True)
+
+    def _api_name(self):
+        if self._use_wasapi() is not None:
+            return "WASAPI"
+        if self.devices is not None and self.io is not None and hasattr(self.sd,
+                                                                         "query_hostapis"):
+            try:
+                return self.sd.query_hostapis()[self.devices[self.io[0]]["hostapi"]]["name"]
+            except Exception:
+                pass
+        return None
+
+    def _duplex(self, inp, out, out_channels, callback):
+        i, xi = self._route(inp, "input")
+        o, xo = self._route(out, "output")
+        kw = {"extra_settings": (xi, xo)} if xi is not None else {}
+        return self.sd.Stream(device=(i, o), samplerate=self.sr, blocksize=self.block,
+                              channels=(1, out_channels), dtype="float32",
+                              latency=self.lat["latency"], callback=callback, **kw)
+
+    def _queue_out(self, device, channels):
+        d, x = self._route(device, "output")
+        return Listen(self.sd, self.sr, self.block, d, channels, start=False,
+                      prime=self.lat["prime"], latency=self.lat["latency"],
+                      extra_settings=x)
+
+    # ----- audio callbacks
     def _process(self, indata):
         x = indata[:, 0]
         if self.enabled:
@@ -660,6 +861,7 @@ class Engine:
         if cable is not None:
             cable.push(y.copy())
 
+    # ----- opening and closing streams
     def start(self, inp, out, mon=None, out_channels=1):
         """(Re)open the mic -> virtual cable stream (e.g. after picking another mic)."""
         self.io = (inp, out, out_channels)
@@ -685,49 +887,64 @@ class Engine:
         is fed through a short queue instead.
         """
         shared = self._shares_device()
-        if not main and not shared and self.mode == "normal" and self.stream is not None:
-            # just the headphones changed, on their own device: leave Discord's stream alone
-            self._close_listen()
-            if self.listen_cfg is not None:
-                device, channels = self.listen_cfg
-                try:
-                    self.listen = Listen(self.sd, self.sr, self.block, device, channels)
-                except Exception:
-                    self.listen_cfg = None
-                    raise
-            return
-        if self.io is None:
-            return
-        if main and not shared and self.mode == "normal":
-            # another mic, headphones on their own device: keep them playing
-            self._close_main()
-            mic, cable, cable_channels = self.io
-            self.stream = self.sd.Stream(device=(mic, cable), samplerate=self.sr,
-                                         blocksize=self.block, channels=(1, cable_channels),
-                                         dtype="float32", latency="low",
-                                         callback=self.callback)
-            self.stream.start()
-            if self.listen is None and self.listen_cfg is not None:
-                device, channels = self.listen_cfg
-                try:
-                    self.listen = Listen(self.sd, self.sr, self.block, device, channels)
-                except Exception:
-                    self.listen_cfg = None
-                    raise
-            return
-        was_shared = self.mode == "shared"
+        try:
+            if not main and not shared and self.mode == "normal" and self.stream is not None:
+                # just the headphones changed, on their own device: leave Discord alone
+                self._close_listen()
+                if self.listen_cfg is not None:
+                    device, channels = self.listen_cfg
+                    try:
+                        self.listen = self._queue_out(device, channels)
+                        self.listen.start()
+                    except Exception:
+                        self.listen = None
+                        self.listen_cfg = None
+                        raise
+                return
+            if self.io is None:
+                return
+            if main and not shared and self.mode == "normal":
+                # another mic, headphones on their own device: keep them playing
+                self._close_main()
+                mic, cable, cable_channels = self.io
+                self.stream = self._duplex(mic, cable, cable_channels, self.callback)
+                self.stream.start()
+                if self.listen is None and self.listen_cfg is not None:
+                    device, channels = self.listen_cfg
+                    try:
+                        self.listen = self._queue_out(device, channels)
+                        self.listen.start()
+                    except Exception:
+                        self.listen_cfg = None
+                        raise
+                self.api = self._api_name()
+                return
+            self._rebuild(pause=shared or self.mode == "shared")
+        except Exception:
+            if self._use_wasapi() is not None and self.io is not None:
+                # WASAPI refused (format, exclusive use, ...): same thing over MME
+                self._wasapi_failed = True
+                self._rebuild()
+                return
+            raise
+
+    def _rebuild(self, pause=False):
+        """Close everything, create all streams while the devices are idle, start."""
         self.stop()
-        if shared or was_shared:
+        if pause:
             import time
             time.sleep(0.15)  # CoreAudio releases a stopped device asynchronously
         try:
             self._build()
         except Exception:
+            self.stop()
+            if self._use_wasapi() is not None:
+                self._wasapi_failed = True
+                return self._rebuild(pause=pause)
             if self.listen_cfg is None:
                 raise
             # Discord must keep hearing us even if the headphones fail
             self.listen_cfg = None
-            self.stop()
             self._build()
             self._start_all()
             raise
@@ -737,28 +954,16 @@ class Engine:
         mic, cable, cable_channels = self.io
         if self._shares_device():
             device, channels = self.listen_cfg
-            self.cable = Listen(self.sd, self.sr, self.block, cable, cable_channels,
-                                start=False)
-            try:
-                self.stream = self.sd.Stream(device=(mic, device), samplerate=self.sr,
-                                             blocksize=self.block, channels=(1, channels),
-                                             dtype="float32", latency="low",
-                                             callback=self.callback_shared)
-            except Exception:
-                self._close_cable()
-                raise
+            self.cable = self._queue_out(cable, cable_channels)
+            self.stream = self._duplex(mic, device, channels, self.callback_shared)
             self.mode = "shared"
         else:
-            # write the same signal to both channels: some apps only listen to one
-            self.stream = self.sd.Stream(device=(mic, cable), samplerate=self.sr,
-                                         blocksize=self.block, channels=(1, cable_channels),
-                                         dtype="float32", latency="low",
-                                         callback=self.callback)
+            self.stream = self._duplex(mic, cable, cable_channels, self.callback)
             self.mode = "normal"
             if self.listen_cfg is not None:
                 device, channels = self.listen_cfg
-                self.listen = Listen(self.sd, self.sr, self.block, device, channels,
-                                     start=False)
+                self.listen = self._queue_out(device, channels)
+        self.api = self._api_name()
 
     def _start_all(self):
         for out in (self.listen, self.cable):
@@ -877,6 +1082,7 @@ def run_live(args):
 
     eff = effective_settings(args, settings)
     engine = Engine(sd, args.samplerate, args.block, eff)
+    engine.devices = devices
     print(f"\nМикрофон: {devices[inp]['name']}   (сменить: запусти с --choose)")
     print(f"В Discord выбери устройство ввода: {discord_device_name(devices[out]['name'])}\n")
     try:
@@ -921,13 +1127,13 @@ PRESETS = {
     # Ye "All the Love" (Bully), the opening line: André Troutman's talk box —
     # a pure, warm synth voice gliding between tuned notes
     "Бабияй": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0,
-               "talkbox_glide": 0.1, "talkbox_tone": 0.4},
+               "talkbox_glide": 0.1, "talkbox_tone": 0.5},
     "Чистый ток-бокс": {"speed": 1.0, "transpose": 0.0, "mix": 1.0, "talkbox": 1.0,
-                        "talkbox_glide": 0.03, "talkbox_tone": 0.65},
+                        "talkbox_glide": 0.03, "talkbox_tone": 0.6},
     "Бурундук": {"speed": 0.9, "transpose": 12.0, "mix": 1.0, "talkbox": 0.0},
     "Демон": {"speed": 0.9, "transpose": -8.0, "mix": 1.0, "talkbox": 0.0},
     "Сброс": {"speed": 0.9, "transpose": 0.0, "mix": 1.0, "talkbox": 0.0, "gain": 1.0,
-              "gate": -45.0, "talkbox_glide": 0.08, "talkbox_tone": 0.5},
+              "gate": -45.0, "talkbox_glide": 0.08, "talkbox_tone": 0.5, "compressor": 0.4},
 }
 
 # Discord dark theme
@@ -1417,6 +1623,7 @@ def run_gui(args):
 
     eff = effective_settings(args, settings)
     engine = Engine(sd, args.samplerate, args.block, eff)
+    engine.devices = devices
     tuner = engine.tuner
 
     mics = list_mics(devices, api)
@@ -1607,12 +1814,49 @@ def run_gui(args):
     mic_menu.set(devices[inp]["name"])
     mic_menu.grid(row=1, column=1, sticky="w", padx=(0, 16), pady=6)
     hint = ctk.CTkFrame(dev, fg_color="transparent")
-    hint.grid(row=2, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 14))
+    hint.grid(row=2, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 6))
     ctk.CTkLabel(hint, text="●", text_color=C_GREEN, font=font(12)).pack(side="left")
     ctk.CTkLabel(hint, text="  В Discord выбери микрофон:  ", font=font(13),
                  text_color=C_MUTED).pack(side="left")
     ctk.CTkLabel(hint, text=discord_device_name(devices[out]["name"]), font=font(13, "bold"),
                  text_color=C_TEXT).pack(side="left")
+
+    # --- latency: how much buffering to trade for delay
+    ctk.CTkLabel(dev, text="Задержка", font=font(13), text_color=C_MUTED,
+                 anchor="w").grid(row=3, column=0, sticky="w", padx=16, pady=(4, 2))
+    lat_keys = list(LATENCY_MODES)
+    lat_labels = [LATENCY_MODES[k]["label"] for k in lat_keys]
+
+    def on_latency(label):
+        key = lat_keys[lat_labels.index(label)]
+        settings["latency"] = key
+        schedule_save()
+        try:
+            engine.set_latency(key)
+        except Exception as e:
+            messagebox.showerror("Автотюн", f"Не удалось перезапустить звук:\n{e}")
+
+    lat_seg = ctk.CTkSegmentedButton(dev, values=lat_labels, command=on_latency, height=30,
+                                     font=font(12, "bold"), corner_radius=4,
+                                     fg_color=C_INPUT, unselected_color=C_INPUT,
+                                     unselected_hover_color=C_HOVER, selected_color=C_BLURPLE,
+                                     selected_hover_color=C_BLURPLE_HOVER, text_color=C_TEXT)
+    lat_seg.set(LATENCY_MODES[eff["latency"]]["label"])
+    lat_seg.grid(row=3, column=1, sticky="w", padx=(0, 16), pady=(4, 2))
+    lat_info = ctk.CTkLabel(dev, text="", font=font(11), text_color=C_FAINT, anchor="w")
+    lat_info.grid(row=4, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 14))
+
+    def latency_text():
+        phones, cable = engine.latency_estimate()
+        parts = []
+        if phones is not None:
+            parts.append(f"в наушниках ≈ {phones * 1000:.0f} мс")
+        parts.append(f"в Discord ≈ {cable * 1000:.0f} мс + сам Discord")
+        if engine.api:
+            parts.append(engine.api)
+        tip = ("если трещит — выбери «Надёжная»" if engine.lat is not LATENCY_MODES["safe"]
+               else "")
+        return "   ·   ".join(parts) + (f"   ·   {tip}" if tip else "")
 
     # --- hear yourself in headphones
     lis = card("ПРОСЛУШИВАНИЕ", 3)
@@ -1728,6 +1972,7 @@ def run_gui(args):
     def set_talkbox(v): tuner.talkbox = v
     def set_glide(v): tuner.tb.glide = v
     def set_tone(v): tuner.tb.tone = v
+    def set_comp(v): tuner.comp.amount = v
     def set_gain(v): engine.gain = v
     def set_gate(v): tuner.gate_db = v
 
@@ -1743,12 +1988,14 @@ def run_gui(args):
         ("talkbox_glide", "Глайд ток-бокса", "за сколько голос доезжает до новой ноты",
          0, 200, 200, lambda v: v * 1000, lambda u: u / 1000,
          lambda v: f"{v * 1000:.0f} мс", set_glide),
-        ("talkbox_tone", "Яркость ток-бокса", "0% — глухо, как через трубку; 100% — ярко",
+        ("talkbox_tone", "Яркость ток-бокса", "50% — как настоящий ток-бокс; меньше — глуше",
          0, 100, 100, lambda v: v * 100, lambda u: u / 100, pct, set_tone),
         ("transpose", "Сдвиг высоты", "в полутонах, 12 = октава", -12, 12, 24,
          lambda v: v, lambda u: float(round(u)), lambda v: f"{v:+.0f}", set_transpose),
         ("mix", "Сила эффекта", "смесь с чистым голосом", 0, 100, 100,
          lambda v: v * 100, lambda u: u / 100, pct, set_mix),
+        ("compressor", "Компрессор", "выравнивает громкость: тихое громче, громкое тише",
+         0, 100, 100, lambda v: v * 100, lambda u: u / 100, pct, set_comp),
         ("gain", "Громкость", "", 0, 200, 200,
          lambda v: v * 100, lambda u: u / 100, pct, set_gain),
         ("gate", "Порог шума", "тише этого — без обработки", -70, -20, 50,
@@ -1857,6 +2104,9 @@ def run_gui(args):
             show(note_lbl, text="—", text_color=C_FAINT)
             show(info_lbl, text="Спой что-нибудь")
         meter.set(min(1.0, engine.level))
+        refresh.ticks = getattr(refresh, "ticks", 0) + 1
+        if refresh.ticks % 12 == 1:
+            show(lat_info, text=latency_text())
         hk = hotkey["obj"]
         if hk is not None and hk.presses != hotkey["seen"]:
             n = hk.presses - hotkey["seen"]
@@ -1916,12 +2166,16 @@ def main():
     p.add_argument("--talkbox-glide", dest="talkbox_glide", type=float,
                    help="ток-бокс: за сколько секунд голос доезжает до новой ноты (0.08)")
     p.add_argument("--talkbox-tone", dest="talkbox_tone", type=float,
-                   help="ток-бокс: яркость 0..1 (0 — глухо, 1 — ярко)")
+                   help="ток-бокс: яркость 0..1 (0.5 — как настоящий ток-бокс)")
+    p.add_argument("--compressor", type=float,
+                   help="0..1, компрессор: выравнивает громкость (0 — выкл., по умолчанию 0.4)")
     p.add_argument("--gain", type=float, help="громкость на выходе")
     p.add_argument("--gate", type=float,
                    help="порог тишины в дБ (ниже — без обработки)")
     p.add_argument("--nogui", action="store_true",
                    help="работать в консоли без окна настроек")
+    p.add_argument("--latency", choices=list(LATENCY_MODES),
+                   help="задержка: min (минимальная), normal (обычная), safe (надёжная)")
     p.add_argument("--samplerate", type=int, default=48000)
     p.add_argument("--block", type=int, default=256, help="размер блока (задержка)")
     p.add_argument("--print-driver-install", action="store_true", help=argparse.SUPPRESS)
